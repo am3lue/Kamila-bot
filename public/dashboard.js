@@ -492,13 +492,13 @@
         </div>
       </div>
     `;
-    // Fetch config from a lightweight check
+    // Fetch config
     try {
-      const s = await api('/api/stats');
-      $('#cfg-ollama').textContent = 'http://localhost:11434';
-      $('#cfg-model').textContent = 'kamila';
-      $('#cfg-timeout').textContent = '30000';
-      $('#cfg-ratelimit').textContent = '2000';
+      const cfg = await api('/api/config');
+      $('#cfg-ollama').textContent = cfg.ollamaUrl || 'http://localhost:11434';
+      $('#cfg-model').textContent = cfg.modelName || 'kamila';
+      $('#cfg-timeout').textContent = cfg.timeout || '30000';
+      $('#cfg-ratelimit').textContent = cfg.rateLimit || '2000';
     } catch {}
     // Wire up import button and file upload
     const importBtn = $('#import-btn');
@@ -522,14 +522,14 @@
       try {
         let res;
         if (isVCard) {
-          res = await api('/api/contacts/import', { method: 'POST', body: JSON.stringify({ vcard: text }) });
+          res = await post('/api/contacts/import', { vcard: text });
         } else {
           const lines = text.split('\n').filter(l => l.trim());
           const contacts = lines.map(l => {
             const [phone, ...nameParts] = l.split(',');
             return { phone: phone.trim(), name: nameParts.join(',').trim() };
           });
-          res = await api('/api/contacts/import', { method: 'POST', body: JSON.stringify({ contacts }) });
+          res = await post('/api/contacts/import', { contacts });
         }
         result.textContent = `Done: ${res.added} added, ${res.updated} updated, ${res.skipped || 0} skipped (of ${res.total})`;
         result.style.color = 'var(--green)';
@@ -547,7 +547,7 @@
       result.textContent = 'Syncing WhatsApp contacts...';
       result.style.color = 'var(--muted)';
       try {
-        const res = await api('/api/contacts/sync', { method: 'POST' });
+        const res = await post('/api/contacts/sync', {});
         result.textContent = `Sync: ${res.matched} on WhatsApp, ${res.unmatched} not found (of ${res.total})`;
         result.style.color = 'var(--green)';
       } catch (err) {
@@ -668,7 +668,7 @@
       status.style.color = 'var(--muted)';
       try {
         const mode = $('#bc-enhance-mode').value;
-        const res = await api('/api/enhance', { method: 'POST', body: JSON.stringify({ text, mode }) });
+        const res = await post('/api/enhance', { text, mode });
         $('#bc-message').value = res.enhanced;
         status.textContent = 'Enhanced!';
         status.style.color = 'var(--green)';
@@ -690,7 +690,7 @@
       result.style.color = 'var(--muted)';
       $('#bc-send-btn').disabled = true;
       try {
-        const res = await api('/api/broadcast', { method: 'POST', body: JSON.stringify({ contacts: phones, text, delayMs: delay }) });
+        const res = await post('/api/broadcast', { contacts: phones, text, delayMs: delay });
         result.innerHTML = `Sent: <strong>${res.sent}</strong> / Failed: <strong>${res.failed}</strong> / Total: ${res.total}`;
         result.style.color = res.failed > 0 ? 'var(--yellow)' : 'var(--green)';
       } catch (err) {

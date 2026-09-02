@@ -130,6 +130,43 @@ app.use(express.json());
 app.use(express.static(join(__dirname, 'public')));
 app.get('/', (_req, res) => res.redirect(302, '/dashboard.html'));
 
+// ── Security Headers ──
+app.use((_req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  next();
+});
+
+// ── API Key Auth (optional, set API_KEY in .env) ──
+const API_KEY = process.env.API_KEY;
+if (!API_KEY) console.warn('[Security] No API_KEY set — dashboard is UNPROTECTED. Set API_KEY in .env for production.');
+
+function requireAuth(req, res, next) {
+  if (!API_KEY) return next();
+  const key = req.headers['x-api-key'] || req.query.key;
+  if (key !== API_KEY) return res.status(401).json({ error: 'Unauthorized — set x-api-key header or ?key= param' });
+  next();
+}
+
+// ── CSRF Protection (same-origin check for POST) ──
+app.use((req, res, next) => {
+  if (req.method === 'POST' && req.headers['content-type']?.includes('application/json')) {
+    const origin = req.headers.origin || req.headers.referer || '';
+    if (origin && !origin.includes(`localhost:${PORT}`) && !origin.includes(`127.0.0.1:${PORT}`)) {
+      return res.status(403).json({ error: 'CSRF rejected' });
+    }
+  }
+  next();
+});
+
+// Apply auth to all /api routes (except status and events for dashboard init)
+app.use('/api', (req, res, next) => {
+  if (req.path === '/status' || req.path === '/events') return next();
+  return requireAuth(req, res, next);
+});
+
 // Catch GET on POST-only API routes (browser extensions / preflight noise)
 app.get('/api/enhance', (_req, res) => res.status(405).json({ error: 'Use POST' }));
 app.get('/api/broadcast', (_req, res) => res.status(405).json({ error: 'Use POST' }));
@@ -457,6 +494,16 @@ app.get('/api/status', (_req, res) => {
   res.json({ connected: whatsappReady, hasQr: !!qrCode });
 });
 
+app.get('/api/config', (_req, res) => {
+  res.json({
+    ollamaUrl: OLLAMA_URL,
+    modelName: MODEL_NAME,
+    timeout: AXIOS_TIMEOUT_MS,
+    rateLimit: RATE_LIMIT_COOLDOWN_MS,
+    hasApiKey: !!API_KEY,
+  });
+});
+
 app.get('/api/stats', (_req, res) => {
   try {
     const contacts = stmts.countTable('contacts');
@@ -640,6 +687,8 @@ app.post('/api/complete-task', (req, res) => {
 
 app.post('/api/evaluate', async (req, res) => {
   const { chatId } = req.body;
+  if (!chatId || typeof chatId !== 'string')
+    return res.status(400).json({ error: 'chatId required (string)' });
   await evaluateConversation(chatId);
   await extractTasks(chatId);
   res.json({ ok: true });
@@ -662,7 +711,8 @@ app.post('/api/broadcast', async (req, res) => {
   let sent = 0, failed = 0;
   const errors = [];
 
-  for (const phone of contacts) {
+  for (let i = 0; i < contacts.length; i++) {
+    const phone = contacts[i];
     const chatId = phone.includes('@') ? phone : phone.replace(/[^0-9]/g, '') + '@c.us';
     try {
       for (const chunk of splitMessage(text)) await client.sendMessage(chatId, chunk);
@@ -673,7 +723,7 @@ app.post('/api/broadcast', async (req, res) => {
       failed++;
       errors.push({ phone: chatId, error: err.message });
     }
-    if (contacts.indexOf(phone) < contacts.length - 1) {
+    if (i < contacts.length - 1) {
       await new Promise((r) => setTimeout(r, delay));
     }
   }
