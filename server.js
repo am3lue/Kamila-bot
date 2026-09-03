@@ -21,6 +21,8 @@ const {
   PUPPETEER_HEADLESS = 'true',
   PUPPETEER_ARGS = '--no-sandbox,--disable-setuid-sandbox',
   DB_PATH = './kamila.db',
+  WHITELIST = '',
+  BLACKLIST = '',
 } = process.env;
 
 const MAX_MSG_LEN = 2000;
@@ -69,6 +71,10 @@ db.exec(`
     text TEXT NOT NULL,
     created_at INTEGER DEFAULT (unixepoch())
   );
+  CREATE TABLE IF NOT EXISTS access (
+    phone_number TEXT PRIMARY KEY,
+    list_type TEXT CHECK(list_type IN ('WHITELIST','BLACKLIST')) NOT NULL
+  );
 `);
 
 const stmts = {
@@ -76,6 +82,16 @@ const stmts = {
   upsertContactBatch: db.prepare(`INSERT INTO contacts (phone_number, name) VALUES (@phone, @name) ON CONFLICT(phone_number) DO UPDATE SET name = CASE WHEN excluded.name = '' THEN contacts.name ELSE excluded.name END`),
   getContact: db.prepare(`SELECT * FROM contacts WHERE phone_number = ?`),
   setContactMode: db.prepare(`UPDATE contacts SET auto_reply_mode = ? WHERE phone_number = ?`),
+  // Access control (whitelist / blacklist)
+  getAccessType: db.prepare(`SELECT list_type FROM access WHERE phone_number = ?`),
+  getWhitelist: db.prepare(`SELECT phone_number FROM access WHERE list_type = 'WHITELIST' ORDER BY phone_number`),
+  getBlacklist: db.prepare(`SELECT phone_number FROM access WHERE list_type = 'BLACKLIST' ORDER BY phone_number`),
+  allAccess: db.prepare(`SELECT phone_number, list_type FROM access ORDER BY list_type, phone_number`),
+  getWhitelistCount: db.prepare(`SELECT COUNT(*) AS n FROM access WHERE list_type = 'WHITELIST'`),
+  addAccess: db.prepare(`INSERT INTO access (phone_number, list_type) VALUES (?, ?) ON CONFLICT(phone_number) DO UPDATE SET list_type = excluded.list_type`),
+  addAccessIfMissing: db.prepare(`INSERT INTO access (phone_number, list_type) VALUES (?, ?) ON CONFLICT(phone_number) DO NOTHING`),
+  removeAccess: db.prepare(`DELETE FROM access WHERE phone_number = ?`),
+  clearAccess: db.prepare(`DELETE FROM access WHERE list_type = ?`),
   insertMessage: db.prepare(`INSERT INTO messages (chat_id, sender, text, is_ai) VALUES (?, ?, ?, ?)`),
   getMessages: db.prepare(`SELECT * FROM messages WHERE chat_id = ? ORDER BY timestamp DESC LIMIT 50`),
   getContactMessages: db.prepare(`SELECT * FROM messages WHERE chat_id = ? ORDER BY timestamp ASC`),
@@ -111,6 +127,44 @@ const stmts = {
   deleteDraftsByChat: db.prepare(`DELETE FROM drafts WHERE chat_id = ?`),
 };
 
+// ── Access control (whitelist / blacklist) ──
+
+// Canonical phone form: digits only, international format, no separators or
+// WhatsApp ID suffixes (@c.us/@lid/@g.us/@s.whatsapp.net). Used for BOTH
+// lookups and storage so whitelist/blacklist actually match inbound IDs.
+function canonicalPhone(input) {
+  if (typeof input !== 'string') return null;
+  const cleaned = input.trim()
+    .replace(/@c\.us$|@lid$|@g\.us$|@s\.whatsapp\.net$/i, '')
+    .replace(/[^0-9]/g, '');
+  return cleaned.length >= 7 ? cleaned : null;
+}
+
+// Seed access table from env boot defaults (add-only, doesn't override
+// dashboard-managed entries).
+(function seedAccessFromEnv() {
+  const seed = (list, type) => {
+    for (const raw of String(list).split(',')) {
+      const phone = canonicalPhone(raw);
+      if (phone) stmts.addAccessIfMissing.run(phone, type);
+    }
+  };
+  seed(WHITELIST, 'WHITELIST');
+  seed(BLACKLIST, 'BLACKLIST');
+})();
+
+// Precedence: blacklist always wins. Otherwise, if a whitelist is active
+// (non-empty), only whitelisted numbers are allowed. With an empty whitelist
+// everyone not blacklisted is allowed.
+function accessAllowed(chatId) {
+  const phone = canonicalPhone(chatId);
+  if (!phone) return false;
+  const row = stmts.getAccessType.get(phone);
+  if (row?.list_type === 'BLACKLIST') return false;
+  if (row?.list_type === 'WHITELIST') return true;
+  return stmts.getWhitelistCount.get().n === 0;
+}
+
 // ── SSE Infrastructure ──
 
 const sseBus = new EventEmitter();
@@ -140,23 +194,34 @@ app.use((_req, res, next) => {
   next();
 });
 
-// ── API Key Auth (optional, set API_KEY in .env) ──
+// ── API Key Auth (opt-in) ──
+// The dashboard itself is served on localhost and does not require a key.
+// Set REQUIRE_AUTH=1 AND API_KEY in .env to protect the /api routes for
+// external API consumers. When disabled the key stays in .env for later use.
 const API_KEY = process.env.API_KEY;
-if (!API_KEY) console.warn('[Security] No API_KEY set — dashboard is UNPROTECTED. Set API_KEY in .env for production.');
+const REQUIRE_AUTH = process.env.REQUIRE_AUTH === '1' || process.env.REQUIRE_AUTH === 'true';
+if (REQUIRE_AUTH && !API_KEY) console.warn('[Security] REQUIRE_AUTH=1 but no API_KEY set — set API_KEY in .env.');
 
 function requireAuth(req, res, next) {
-  if (!API_KEY) return next();
-  const key = req.headers['x-api-key'] || req.query.key;
-  if (key !== API_KEY) return res.status(401).json({ error: 'Unauthorized — set x-api-key header or ?key= param' });
+  if (!REQUIRE_AUTH) return next();
+  const key = req.headers['x-api-key'];
+  if (!key || key !== API_KEY) return res.status(401).json({ error: 'Unauthorized — set x-api-key header' });
   next();
 }
 
 // ── CSRF Protection (same-origin check for POST) ──
 app.use((req, res, next) => {
   if (req.method === 'POST' && req.headers['content-type']?.includes('application/json')) {
-    const origin = req.headers.origin || req.headers.referer || '';
-    if (origin && !origin.includes(`localhost:${PORT}`) && !origin.includes(`127.0.0.1:${PORT}`)) {
-      return res.status(403).json({ error: 'CSRF rejected' });
+    const origin = req.headers.origin || '';
+    if (origin) {
+      let host;
+      try { host = new URL(origin).hostname; } catch { host = ''; }
+      const ipv4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
+      const ip4 = ipv4.exec(host);
+      const validIpv4 = ip4 && ip4.slice(1).every(o => Number(o) <= 255);
+      const loopback = host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '0.0.0.0';
+      const allowed = host === '' || origin.startsWith('file://') || loopback || !!validIpv4;
+      if (!allowed) return res.status(403).json({ error: 'CSRF rejected' });
     }
   }
   next();
@@ -175,6 +240,8 @@ app.get('/api/send', (_req, res) => res.status(405).json({ error: 'Use POST' }))
 app.get('/api/send-draft', (_req, res) => res.status(405).json({ error: 'Use POST' }));
 app.get('/api/contacts/import', (_req, res) => res.status(405).json({ error: 'Use POST' }));
 app.get('/api/contacts/sync', (_req, res) => res.status(405).json({ error: 'Use POST' }));
+app.get('/api/access/remove', (_req, res) => res.status(405).json({ error: 'Use POST' }));
+app.get('/api/access/clear', (_req, res) => res.status(405).json({ error: 'Use POST' }));
 
 const httpServer = app.listen(PORT, () => {
   console.log(`[Dashboard] http://localhost:${PORT}`);
@@ -433,6 +500,9 @@ client.on('message', async (msg) => {
     // Groups: read-only, no reply, no AI
     if (isGroup) return;
 
+    // Access control: silently ignore blocked / not-allowed numbers (still logged)
+    if (!accessAllowed(msg.from)) return;
+
     if (!checkRateLimit(msg.from)) return;
     if (mode === 'OFF') return;
 
@@ -490,7 +560,7 @@ client.on('message', async (msg) => {
 // ── API Routes ──
 
 app.get('/api/status', (_req, res) => {
-  res.json({ connected: whatsappReady, hasQr: !!qrCode, hasApiKey: !!API_KEY });
+  res.json({ connected: whatsappReady, hasQr: !!qrCode, hasApiKey: REQUIRE_AUTH });
 });
 
 app.get('/api/config', (_req, res) => {
@@ -499,7 +569,7 @@ app.get('/api/config', (_req, res) => {
     modelName: MODEL_NAME,
     timeout: AXIOS_TIMEOUT_MS,
     rateLimit: RATE_LIMIT_COOLDOWN_MS,
-    hasApiKey: !!API_KEY,
+    hasApiKey: false,
   });
 });
 
@@ -559,6 +629,51 @@ app.post('/api/contacts/:id/mode', (req, res) => {
   stmts.setContactMode.run(mode, id);
   broadcast('contact', { phone_number: id, mode });
   res.json({ ok: true, mode });
+});
+
+// ── Access control (whitelist / blacklist) ──
+
+app.get('/api/access', (_req, res) => {
+  res.json({
+    whitelist: stmts.getWhitelist.all().map(r => r.phone_number),
+    blacklist: stmts.getBlacklist.all().map(r => r.phone_number),
+    allowlistActive: stmts.getWhitelistCount.get().n > 0,
+  });
+});
+
+app.get('/api/access/status/:phone', (req, res) => {
+  const phone = canonicalPhone(req.params.phone);
+  if (!phone) return res.status(400).json({ error: 'Invalid phone number' });
+  res.json({ phone, allowed: accessAllowed(phone) });
+});
+
+app.post('/api/access', (req, res) => {
+  const { phone, list_type } = req.body || {};
+  const normalized = canonicalPhone(phone);
+  if (!normalized) return res.status(400).json({ error: 'Invalid phone number' });
+  if (!['WHITELIST', 'BLACKLIST'].includes(list_type))
+    return res.status(400).json({ error: 'list_type must be WHITELIST or BLACKLIST' });
+  stmts.addAccess.run(normalized, list_type);
+  broadcast('access', { phone: normalized, list_type });
+  res.json({ ok: true, phone: normalized, list_type });
+});
+
+app.post('/api/access/remove', (req, res) => {
+  const { phone } = req.body || {};
+  const normalized = canonicalPhone(phone);
+  if (!normalized) return res.status(400).json({ error: 'Invalid phone number' });
+  stmts.removeAccess.run(normalized);
+  broadcast('access', { phone: normalized, removed: true });
+  res.json({ ok: true, phone: normalized });
+});
+
+app.post('/api/access/clear', (req, res) => {
+  const { list_type } = req.body || {};
+  if (!['WHITELIST', 'BLACKLIST'].includes(list_type))
+    return res.status(400).json({ error: 'list_type must be WHITELIST or BLACKLIST' });
+  const info = stmts.clearAccess.run(list_type);
+  broadcast('access', { list_type, cleared: true });
+  res.json({ ok: true, list_type, cleared: info.changes });
 });
 
 app.post('/api/contacts/import', (req, res) => {
@@ -631,10 +746,12 @@ app.post('/api/send', async (req, res) => {
   const { chatId, text } = req.body;
   if (!chatId || !text || typeof chatId !== 'string' || typeof text !== 'string')
     return res.status(400).json({ error: 'chatId and text required (strings)' });
-  if (!chatId.match(/^\d+@c\.us$/))
-    return res.status(400).json({ error: 'Invalid chatId format (expected number@c.us)' });
+  if (!/^\d+@(c\.us|lid|g\.us|s\.whatsapp\.net)$/.test(chatId))
+    return res.status(400).json({ error: 'Invalid chatId format (expected number@c.us etc.)' });
   if (text.length > 10000)
     return res.status(400).json({ error: 'Message too long (max 10000 chars)' });
+  if (!accessAllowed(chatId))
+    return res.status(403).json({ error: 'This contact is blocked by access control' });
   try {
     for (const chunk of splitMessage(text)) await client.sendMessage(chatId, chunk);
     stmts.insertMessage.run(chatId, 'kamila', text, 1);
@@ -655,6 +772,8 @@ app.post('/api/send-draft', async (req, res) => {
     draft = stmts.getDraftsByChat.get(chatId);
   }
   if (!draft) return res.status(404).json({ error: 'No draft found' });
+  if (!accessAllowed(draft.chat_id))
+    return res.status(403).json({ error: 'This contact is blocked by access control' });
   try {
     for (const chunk of splitMessage(draft.text)) await client.sendMessage(draft.to_number, chunk);
     stmts.insertMessage.run(draft.chat_id, 'kamila', draft.text, 1);
@@ -707,12 +826,13 @@ app.post('/api/broadcast', async (req, res) => {
     return res.status(400).json({ error: 'Max 500 contacts per broadcast' });
 
   const delay = Math.max(1000, Math.min(30000, Number(delayMs) || 2000));
-  let sent = 0, failed = 0;
+  let sent = 0, failed = 0, skipped = 0;
   const errors = [];
 
   for (let i = 0; i < contacts.length; i++) {
     const phone = contacts[i];
     const chatId = phone.includes('@') ? phone : phone.replace(/[^0-9]/g, '') + '@c.us';
+    if (!accessAllowed(chatId)) { skipped++; continue; }
     try {
       for (const chunk of splitMessage(text)) await client.sendMessage(chatId, chunk);
       stmts.insertMessage.run(chatId, 'kamila', text, 1);
@@ -727,8 +847,8 @@ app.post('/api/broadcast', async (req, res) => {
     }
   }
 
-  broadcast('broadcast', { sent, failed, total: contacts.length });
-  res.json({ ok: true, sent, failed, total: contacts.length, errors: errors.slice(0, 10) });
+  broadcast('broadcast', { sent, failed, skipped, total: contacts.length });
+  res.json({ ok: true, sent, failed, skipped, total: contacts.length, errors: errors.slice(0, 10) });
 });
 
 // ── AI Enhance ──

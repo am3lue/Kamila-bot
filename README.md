@@ -67,7 +67,8 @@ All config is in `.env`. Copy from `.env.example` and edit:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PORT` | `3000` | Dashboard server port |
-| `API_KEY` | *(empty)* | API key for dashboard auth (blank = dev mode, no auth) |
+| `API_KEY` | *(empty)* | API key for external API consumers (kept in `.env`, never sent to the browser) |
+| `REQUIRE_AUTH` | *(empty)* | Set `1` to require the `x-api-key` header on `/api` routes. Leave empty for an open dashboard |
 | `OLLAMA_URL` | `http://localhost:11434/api/chat` | Ollama API endpoint |
 | `MODEL_NAME` | `kamila` | Ollama model to use |
 | `AXIOS_TIMEOUT_MS` | `30000` | Ollama request timeout (ms) |
@@ -76,6 +77,21 @@ All config is in `.env`. Copy from `.env.example` and edit:
 | `PUPPETEER_ARGS` | `--no-sandbox,--disable-setuid-sandbox` | Chromium flags |
 | `CHROMIUM_PATH` | `/usr/bin/chromium` | Path to Chromium binary |
 | `DB_PATH` | `./kamila.db` | SQLite database file path |
+| `WHITELIST` | *(empty)* | Comma-separated boot numbers for the allowlist |
+| `BLACKLIST` | *(empty)* | Comma-separated boot numbers for the blocklist |
+
+## Access Control
+
+Restrict who the bot interacts with using a **whitelist** (allowlist) and **blacklist**:
+
+- **Blacklist always wins** — a blacklisted number is never replied to and never receives broadcasts, even if it is also whitelisted.
+- When the **whitelist is non-empty**, only whitelisted numbers may chat (allowlist mode).
+- When the whitelist is **empty**, everyone except blacklisted numbers is allowed.
+- Applies to **inbound** auto-replies, **outbound broadcasts**, **manual sends** (`/api/send`), and **draft sends** (`/api/send-draft`).
+- Phone numbers are matched in a canonical digits-only form, so inbound IDs like `12345@c.us`, `12345@lid`, or `12345@s.whatsapp.net` are handled the same.
+- Blocked numbers are silently ignored (their messages are still logged, but Kamila never responds).
+
+Manage the lists from **Dashboard → Settings → Access Control**, or seed initial values via the `WHITELIST` / `BLACKLIST` env vars (used only once at startup).
 
 ## Dashboard
 
@@ -106,6 +122,11 @@ All config is in `.env`. Copy from `.env.example` and edit:
 | `POST` | `/api/broadcast` | Broadcast `{contacts, text, delayMs}` |
 | `POST` | `/api/enhance` | AI enhance text `{text, mode}` |
 | `POST` | `/api/tasks/:id/complete` | Mark task done |
+| `GET` | `/api/access` | Get whitelist & blacklist |
+| `POST` | `/api/access` | Add to access list `{phone, list_type}` |
+| `POST` | `/api/access/remove` | Remove from any list `{phone}` |
+| `POST` | `/api/access/clear` | Clear a list `{list_type}` |
+| `GET` | `/api/access/status/:phone` | Check if a number is allowed |
 
 ## Project Structure
 

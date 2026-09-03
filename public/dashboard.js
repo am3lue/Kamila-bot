@@ -6,8 +6,26 @@
   const $$ = (s, p) => [...(p || document).querySelectorAll(s)];
   const esc = (s) => { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; };
   const apiKey = () => localStorage.getItem('kamila_api_key') || '';
-  const api = (u) => fetch(u, { headers: { 'x-api-key': apiKey() } }).then(r => r.json());
-  const post = (u, b) => fetch(u, { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey() }, body: JSON.stringify(b) }).then(r => r.json());
+  let shown401Toast = false;
+  function apiErr(r, msg) {
+    const e = new Error(msg || 'API error');
+    e.status = r.status;
+    return e;
+  }
+  const api = (u) => fetch(u, { headers: { 'x-api-key': apiKey() } }).then(r => {
+    if (!r.ok) {
+      if (r.status === 401 && !shown401Toast) { shown401Toast = true; toast('API key required — go to Settings to enter it', 'error'); }
+      throw apiErr(r, `GET ${u} failed (${r.status})`);
+    }
+    return r.json();
+  });
+  const post = (u, b) => fetch(u, { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey() }, body: JSON.stringify(b) }).then(r => {
+    if (!r.ok) {
+      if (r.status === 401 && !shown401Toast) { shown401Toast = true; toast('API key required — go to Settings to enter it', 'error'); }
+      throw apiErr(r, `POST ${u} failed (${r.status})`);
+    }
+    return r.json();
+  });
 
   function toast(msg, type = 'info') {
     const el = document.createElement('div');
@@ -151,7 +169,8 @@
   }
 
   async function loadOverviewData() {
-    const data = await api('/api/stats');
+    let data;
+    try { data = await api('/api/stats'); } catch { return; }
     if (!data.totals) return;
     $('#s-contacts').textContent = data.totals.contacts;
     $('#s-messages').textContent = data.totals.messages;
@@ -277,10 +296,10 @@
   }
 
   async function loadContactList(filter) {
-    allContacts = await api('/api/contacts');
+    try { allContacts = await api('/api/contacts'); } catch { return; }
     const el = $('#contact-list');
     if (!el) return;
-    if (!allContacts.length) { el.innerHTML = '<div class="empty-state">No conversations yet. Import contacts in Settings, then chat with them on WhatsApp.</div>'; return; }
+    if (!Array.isArray(allContacts) || !allContacts.length) { el.innerHTML = '<div class="empty-state">No conversations yet. Import contacts in Settings, then chat with them on WhatsApp.</div>'; return; }
 
     // Contacts come back already sorted by most-recent-message; keep server order.
     let filtered = allContacts;
@@ -373,9 +392,14 @@
     const text = input.value.trim();
     if (!text || !selectedChat) return;
     input.value = '';
-    const r = await post('/api/send', { chatId: selectedChat, text });
-    if (r.ok) { await loadChatMessages(selectedChat); }
-    else { toast('Send failed: ' + r.error, 'error'); input.value = text; }
+    try {
+      const r = await post('/api/send', { chatId: selectedChat, text });
+      if (r.ok) { await loadChatMessages(selectedChat); }
+      else { toast('Send failed: ' + (r.error || 'unknown error'), 'error'); input.value = text; }
+    } catch (e) {
+      toast('Send failed: ' + (e.message || 'network error'), 'error');
+      input.value = text;
+    }
   }
 
   async function setChatMode(mode) {
@@ -423,7 +447,9 @@
     const filter = $('#task-filter')?.value || 'pending';
     const search = ($('#task-search')?.value || '').toLowerCase();
     const all = filter !== 'pending' ? '?all=1' : '';
-    let tasks = await api(`/api/tasks${all}`);
+    let tasks;
+    try { tasks = await api(`/api/tasks${all}`); } catch { return; }
+    if (!Array.isArray(tasks)) return;
     if (filter === 'pending') tasks = tasks.filter(t => t.status === 'PENDING');
     else if (filter === 'done') tasks = tasks.filter(t => t.status === 'DONE');
     if (search) tasks = tasks.filter(t => (t.task_description || '').toLowerCase().includes(search));
@@ -484,6 +510,26 @@
           <span id="api-key-status" style="font-size:12px;color:var(--muted)"></span>
         </div>
       </div>
+      <div class="section-title">Access Control</div>
+      <div class="card">
+        <p style="color:var(--muted);margin:0 0 10px;font-size:13px">One phone number per line (digits only). <b>Blacklist always wins</b> — a blacklisted number never gets replies or broadcasts, even if also whitelisted. When the whitelist is non-empty, only whitelisted numbers are allowed. An empty whitelist allows everyone except blacklisted numbers.</p>
+        <div id="access-status" style="margin-bottom:12px;font-size:13px;font-weight:600"></div>
+        <div style="display:flex;gap:16px;flex-wrap:wrap">
+          <div style="flex:1;min-width:240px">
+            <div style="font-size:13px;font-weight:700;margin-bottom:6px">Whitelist <span style="color:var(--green)">(allowed)</span></div>
+            <textarea id="wl-textarea" rows="6" placeholder="254712345678&#10;254798765432" style="width:100%;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:10px;font-family:monospace;font-size:13px;resize:vertical"></textarea>
+          </div>
+          <div style="flex:1;min-width:240px">
+            <div style="font-size:13px;font-weight:700;margin-bottom:6px">Blacklist <span style="color:var(--red)">(blocked)</span></div>
+            <textarea id="bl-textarea" rows="6" placeholder="254700000000" style="width:100%;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:10px;font-family:monospace;font-size:13px;resize:vertical"></textarea>
+          </div>
+        </div>
+        <div style="display:flex;gap:8px;margin-top:10px;align-items:center">
+          <button id="access-save-wl" class="btn" style="background:var(--green);color:#fff;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-weight:600">Save Whitelist</button>
+          <button id="access-save-bl" class="btn" style="background:var(--red);color:#fff;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-weight:600">Save Blacklist</button>
+          <span id="access-result" style="font-size:13px;color:var(--muted)"></span>
+        </div>
+      </div>
       <div class="section-title">Import Contacts</div>
       <div class="card">
         <div style="display:flex;gap:12px;margin-bottom:12px">
@@ -530,6 +576,50 @@
         apiKeyStatus.textContent = 'Saved (server unreachable)'; apiKeyStatus.style.color = 'var(--yellow)';
       }
     };
+
+    // Access control: load both lists and render status
+    const wlTextarea = $('#wl-textarea');
+    const blTextarea = $('#bl-textarea');
+    const accessStatus = $('#access-status');
+    const accessResult = $('#access-result');
+    async function refreshAccess() {
+      try {
+        const data = await api('/api/access');
+        if (wlTextarea) wlTextarea.value = (data.whitelist || []).join('\n');
+        if (blTextarea) blTextarea.value = (data.blacklist || []).join('\n');
+        if (accessStatus) {
+          const on = data.allowlistActive;
+          accessStatus.textContent = on
+            ? `Allowlist mode: ON — only ${data.whitelist.length} whitelisted number(s) can chat. All others are blocked.`
+            : 'Allowlist mode: OFF — everyone can chat except blacklisted numbers.';
+          accessStatus.style.color = on ? 'var(--red)' : 'var(--green)';
+        }
+        if (accessResult) accessResult.textContent = '';
+      } catch {}
+    }
+    async function saveAccessList(list_type, textarea) {
+      try {
+        const numbers = (textarea.value || '').split('\n').map(s => s.trim()).filter(Boolean);
+        // Clear current list, then add each number
+        await post('/api/access/clear', { list_type });
+        let added = 0, failed = 0;
+        for (const n of numbers) {
+          const r = await post('/api/access', { phone: n, list_type });
+          if (r.ok) added++; else failed++;
+        }
+        if (accessResult) {
+          accessResult.textContent = `${list_type === 'WHITELIST' ? 'Whitelist' : 'Blacklist'} saved: ${added} added, ${failed} invalid`;
+          accessResult.style.color = failed ? 'var(--yellow)' : 'var(--green)';
+        }
+        await refreshAccess();
+      } catch (e) {
+        if (accessResult) { accessResult.textContent = 'Error saving: ' + (e.message || 'unknown'); accessResult.style.color = 'var(--red)'; }
+      }
+    }
+    $('#access-save-wl')?.addEventListener('click', () => saveAccessList('WHITELIST', wlTextarea));
+    $('#access-save-bl')?.addEventListener('click', () => saveAccessList('BLACKLIST', blTextarea));
+    refreshAccess();
+
     // Wire up import button and file upload
     const importBtn = $('#import-btn');
     const importFile = $('#import-file');
@@ -647,7 +737,9 @@
     `;
 
     // Load contacts
-    const contacts = await api('/api/contacts');
+    let contacts;
+    try { contacts = await api('/api/contacts'); } catch {}
+    if (!Array.isArray(contacts)) contacts = [];
     const list = $('#bc-contact-list');
     const selected = new Set(loadState('bc_selected', []));
 

@@ -78,7 +78,7 @@ still open in the current code.
 
 | Question | Decision | Rationale / impact |
 |---|---|---|
-| Auth strength | **Loopback-only bind** (`127.0.0.1`) | Simplest; fully blocks LAN/remote access. No token, no origin allowlist, **no client changes** needed. |
+| Auth strength | ~~**Loopback-only bind** (`127.0.0.1`)~~ **⚠️ SUPERSEDED 2026-09-03T09:08 → use API_KEY, no loopback** | See `code-review-impl+2026-09-03T09-08-43.md` §3/§8. |
 | Typing indicator | **Yes, add it** | AI-generation feedback in the Chats thread. |
 
 > **Session note:** There was ambiguity in an earlier answer ("just once") that did not map to
@@ -93,7 +93,12 @@ intended, given the user's statement *"this is locally runned like i do it only 
 
 ---
 
-## 3. Workstream 1 — Loopback-only auth (security)
+## 3. Workstream 1 — ~~Loopback-only auth~~ ⚠️ SUPERSEDED (API_KEY, no loopback)
+
+> **Status change (2026-09-03T09:08):** This workstream is **dropped**. The user chose to keep
+> the existing optional `API_KEY` auth and **not** bind loopback ("just use API_KEY since its
+> Less Internet required"). Track the replacement in `code-review-impl` **WS-1** (header-only
+> key). The content below is retained for historical record only.
 
 ### 3.1 Goal
 Eliminate remote/LAN exposure of the dashboard and its mutating endpoints with a minimal change.
