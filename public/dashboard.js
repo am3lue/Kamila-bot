@@ -5,8 +5,9 @@
   const $ = (s, p) => (p || document).querySelector(s);
   const $$ = (s, p) => [...(p || document).querySelectorAll(s)];
   const esc = (s) => { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; };
-  const api = (u) => fetch(u).then(r => r.json());
-  const post = (u, b) => fetch(u, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(b) }).then(r => r.json());
+  const apiKey = () => localStorage.getItem('kamila_api_key') || '';
+  const api = (u) => fetch(u, { headers: { 'x-api-key': apiKey() } }).then(r => r.json());
+  const post = (u, b) => fetch(u, { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey() }, body: JSON.stringify(b) }).then(r => r.json());
 
   function toast(msg, type = 'info') {
     const el = document.createElement('div');
@@ -474,6 +475,15 @@
         <div class="setting-row"><span class="setting-key">AXIOS_TIMEOUT_MS</span><span class="setting-val" id="cfg-timeout">Loading...</span></div>
         <div class="setting-row"><span class="setting-key">RATE_LIMIT_COOLDOWN_MS</span><span class="setting-val" id="cfg-ratelimit">Loading...</span></div>
       </div>
+      <div class="section-title">API Key</div>
+      <div class="card">
+        <p style="color:var(--muted);margin:0 0 10px;font-size:13px">This dashboard is protected by an API key (set <code>API_KEY</code> in <code>.env</code>). Enter it here so the dashboard can talk to the server.</p>
+        <div style="display:flex;gap:8px;align-items:center">
+          <input id="api-key-input" type="password" placeholder="Enter API key..." style="flex:1;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:8px 12px;font-size:13px" autocomplete="off">
+          <button id="api-key-save" class="btn" style="background:var(--accent);color:#fff;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-weight:600">Save</button>
+          <span id="api-key-status" style="font-size:12px;color:var(--muted)"></span>
+        </div>
+      </div>
       <div class="section-title">Import Contacts</div>
       <div class="card">
         <div style="display:flex;gap:12px;margin-bottom:12px">
@@ -500,6 +510,26 @@
       $('#cfg-timeout').textContent = cfg.timeout || '30000';
       $('#cfg-ratelimit').textContent = cfg.rateLimit || '2000';
     } catch {}
+
+    // API key: prefill from localStorage, save on click
+    const apiKeyInput = $('#api-key-input');
+    const apiKeySave = $('#api-key-save');
+    const apiKeyStatus = $('#api-key-status');
+    if (apiKeyInput) apiKeyInput.value = localStorage.getItem('kamila_api_key') || '';
+    if (apiKeySave) apiKeySave.onclick = async () => {
+      const key = (apiKeyInput.value || '').trim();
+      if (!key) { apiKeyStatus.textContent = 'Key cleared'; apiKeyStatus.style.color = 'var(--muted)'; }
+      else { apiKeyStatus.textContent = 'Saving...'; apiKeyStatus.style.color = 'var(--muted)'; }
+      localStorage.setItem('kamila_api_key', key);
+      // Test the key
+      try {
+        const r = await fetch('/api/stats', { headers: { 'x-api-key': key } });
+        if (r.ok) { apiKeyStatus.textContent = key ? 'Saved & working ✓' : 'No key — running open'; apiKeyStatus.style.color = 'var(--green)'; }
+        else { apiKeyStatus.textContent = 'Saved (test failed: uses ?key or header)'; apiKeyStatus.style.color = 'var(--yellow)'; }
+      } catch {
+        apiKeyStatus.textContent = 'Saved (server unreachable)'; apiKeyStatus.style.color = 'var(--yellow)';
+      }
+    };
     // Wire up import button and file upload
     const importBtn = $('#import-btn');
     const importFile = $('#import-file');

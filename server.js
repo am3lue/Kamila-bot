@@ -161,9 +161,9 @@ app.use((req, res, next) => {
   next();
 });
 
-// Apply auth to all /api routes (except status and events for dashboard init)
+// Apply auth to all /api routes (except status, events, and config for dashboard bootstrap)
 app.use('/api', (req, res, next) => {
-  if (req.path === '/status' || req.path === '/events') return next();
+  if (req.path === '/status' || req.path === '/events' || req.path === '/config') return next();
   return requireAuth(req, res, next);
 });
 
@@ -489,7 +489,7 @@ client.on('message', async (msg) => {
 // ── API Routes ──
 
 app.get('/api/status', (_req, res) => {
-  res.json({ connected: whatsappReady, hasQr: !!qrCode });
+  res.json({ connected: whatsappReady, hasQr: !!qrCode, hasApiKey: !!API_KEY });
 });
 
 app.get('/api/config', (_req, res) => {
