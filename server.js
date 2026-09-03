@@ -443,10 +443,8 @@ client.on('message', async (msg) => {
     }
 
     const history = stmts.getMessages.all(chatId).reverse().slice(-10);
-    const ollamaMessages = [
-      { role: 'system', content: 'You are Kamila, a helpful WhatsApp assistant. Reply concisely in WhatsApp style. Use *bold* and _italic_ for formatting. Keep responses short and friendly.' },
-      ...history.map((m) => ({ role: m.is_ai ? 'assistant' : 'user', content: m.text }))
-    ];
+    // Persona comes from the model's built-in SYSTEM (Modelfile), not injected here.
+    const ollamaMessages = history.map((m) => ({ role: m.is_ai ? 'assistant' : 'user', content: m.text }));
     const aiReply = await callOllama(ollamaMessages);
 
     if (mode === 'DRAFT') {
