@@ -280,9 +280,9 @@
     allContacts = await api('/api/contacts');
     const el = $('#contact-list');
     if (!el) return;
-    if (!allContacts.length) { el.innerHTML = '<div class="empty-state">No contacts yet. Import contacts in Settings.</div>'; return; }
+    if (!allContacts.length) { el.innerHTML = '<div class="empty-state">No conversations yet. Import contacts in Settings, then chat with them on WhatsApp.</div>'; return; }
 
-    // Sort: contacts with messages first, then alphabetically
+    // Contacts come back already sorted by most-recent-message; keep server order.
     let filtered = allContacts;
     if (filter) {
       const f = filter.toLowerCase();

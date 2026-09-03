@@ -80,6 +80,7 @@ const stmts = {
   getMessages: db.prepare(`SELECT * FROM messages WHERE chat_id = ? ORDER BY timestamp DESC LIMIT 50`),
   getContactMessages: db.prepare(`SELECT * FROM messages WHERE chat_id = ? ORDER BY timestamp ASC`),
   getAllContacts: db.prepare(`SELECT * FROM contacts ORDER BY name ASC, phone_number ASC`),
+  getChattedContacts: db.prepare(`SELECT c.*, MAX(m.timestamp) AS last_message_ts FROM contacts c JOIN messages m ON m.chat_id = c.phone_number GROUP BY c.phone_number ORDER BY last_message_ts DESC, c.name ASC`),
   getAllMessages: db.prepare(`SELECT * FROM messages ORDER BY timestamp DESC LIMIT 200`),
   insertTask: db.prepare(`INSERT INTO tasks (chat_id, task_description, urgency) VALUES (?, ?, ?)`),
   getTasks: db.prepare(`SELECT * FROM tasks WHERE status = 'PENDING' ORDER BY CASE urgency WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 ELSE 3 END`),
@@ -527,7 +528,7 @@ app.get('/api/stats', (_req, res) => {
   }
 });
 
-app.get('/api/contacts', (_req, res) => res.json(stmts.getAllContacts.all()));
+app.get('/api/contacts', (_req, res) => res.json(stmts.getChattedContacts.all()));
 
 app.get('/api/contacts/:id/messages', (req, res) => res.json(stmts.getContactMessages.all(req.params.id)));
 
