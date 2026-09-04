@@ -125,6 +125,8 @@
     if (!handler) { location.hash = '#/overview'; return; }
     $$('.nav-item').forEach(n => n.classList.toggle('active', n.getAttribute('href') === hash));
     currentView = hash.replace('#/', '');
+    // Chats view is full-bleed: no page scroll, only the two panels scroll internally
+    $('#main-content').classList.toggle('chat-view-active', currentView === 'chats');
     // Stop chat poll when leaving chats view
     if (currentView !== 'chats' && chatPollTimer) { clearInterval(chatPollTimer); chatPollTimer = null; }
     handler();
@@ -284,10 +286,11 @@
               <div id="chat-title" style="font-weight:600">Select a contact</div>
               <div id="chat-subtitle" style="font-size:11px;color:var(--text-muted)"></div>
             </div>
-            <div id="mode-controls" style="display:none">
+            <div id="mode-controls" style="display:none;align-items:center;gap:6px">
               <button class="btn btn-sm mode-btn" data-mode="AUTO">AUTO</button>
               <button class="btn btn-sm mode-btn" data-mode="DRAFT">DRAFT</button>
               <button class="btn btn-sm mode-btn" data-mode="OFF">OFF</button>
+              <button class="btn btn-sm" id="drop-btn" style="background:var(--red);color:#fff;border:none;cursor:pointer;margin-left:6px">Drop</button>
             </div>
           </div>
           <div class="chat-messages" id="chat-messages">
@@ -310,6 +313,13 @@
     $('#send-btn').addEventListener('click', sendManualReply);
     $('#msg-input').addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendManualReply(); } });
     $$('.mode-btn').forEach(b => b.addEventListener('click', () => setChatMode(b.dataset.mode)));
+    $('#drop-btn')?.addEventListener('click', () => {
+      if (!selectedChat) return;
+      if (!confirm(`Permanently drop ${selectedChat} and all its data?`)) return;
+      post('/api/contacts/drop', { chatId: selectedChat }).then(r => {
+        if (r.ok) { toast('Dropped ' + selectedChat); selectedChat = null; renderChats(); }
+      }).catch(e => toast('Drop failed: ' + (e.message || 'error'), 'error'));
+    });
 
     // Restore selected chat
     if (selectedChat) {
@@ -344,7 +354,11 @@
       <div class="contact-item ${selectedChat === c.phone_number ? 'active' : ''}" data-id="${esc(c.phone_number)}" data-name="${esc(c.name || '')}">
         <div class="contact-name">${esc(c.name || c.phone_number)}</div>
         <div class="contact-phone">${esc(c.phone_number)}</div>
-        <span class="contact-mode mode-${c.auto_reply_mode}">${c.auto_reply_mode}</span>
+        <div style="display:flex;align-items:center;gap:4px;flex-wrap:wrap">
+          ${c.registered === 0 ? '<span class="badge badge-new">New</span>' : ''}
+          ${c.on_whatsapp === 0 ? '<span class="badge badge-drop">No WA</span>' : ''}
+          <span class="contact-mode mode-${c.auto_reply_mode}">${c.auto_reply_mode}</span>
+        </div>
       </div>`).join('');
     $$('.contact-item', el).forEach(item => item.addEventListener('click', () => selectChat(item.dataset.id, item.dataset.name)));
   }
@@ -585,25 +599,10 @@
           <span id="api-key-status" style="font-size:12px;color:var(--muted)"></span>
         </div>
       </div>
-      <div class="section-title">Access Control</div>
+      <div class="section-title">Pending Registrations</div>
       <div class="card">
-        <p style="color:var(--muted);margin:0 0 10px;font-size:13px">One phone number per line (digits only). <b>Blacklist always wins</b> — a blacklisted number never gets replies or broadcasts, even if also whitelisted. When the whitelist is non-empty, only whitelisted numbers are allowed. An empty whitelist allows everyone except blacklisted numbers.</p>
-        <div id="access-status" style="margin-bottom:12px;font-size:13px;font-weight:600"></div>
-        <div style="display:flex;gap:16px;flex-wrap:wrap">
-          <div style="flex:1;min-width:240px">
-            <div style="font-size:13px;font-weight:700;margin-bottom:6px">Whitelist <span style="color:var(--green)">(allowed)</span></div>
-            <textarea id="wl-textarea" rows="6" placeholder="254712345678&#10;254798765432" style="width:100%;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:10px;font-family:monospace;font-size:13px;resize:vertical"></textarea>
-          </div>
-          <div style="flex:1;min-width:240px">
-            <div style="font-size:13px;font-weight:700;margin-bottom:6px">Blacklist <span style="color:var(--red)">(blocked)</span></div>
-            <textarea id="bl-textarea" rows="6" placeholder="254700000000" style="width:100%;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:10px;font-family:monospace;font-size:13px;resize:vertical"></textarea>
-          </div>
-        </div>
-        <div style="display:flex;gap:8px;margin-top:10px;align-items:center">
-          <button id="access-save-wl" class="btn" style="background:var(--green);color:#fff;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-weight:600">Save Whitelist</button>
-          <button id="access-save-bl" class="btn" style="background:var(--red);color:#fff;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-weight:600">Save Blacklist</button>
-          <span id="access-result" style="font-size:13px;color:var(--muted)"></span>
-        </div>
+        <p style="color:var(--muted);margin:0 0 10px;font-size:13px">New numbers that messaged you and are waiting for registry approval. Approve to register them (AI replies continue), or reject to drop them.</p>
+        <div id="reg-list" style="font-size:13px">Loading...</div>
       </div>
       <div class="section-title">Import Contacts</div>
       <div class="card">
@@ -652,48 +651,36 @@
       }
     };
 
-    // Access control: load both lists and render status
-    const wlTextarea = $('#wl-textarea');
-    const blTextarea = $('#bl-textarea');
-    const accessStatus = $('#access-status');
-    const accessResult = $('#access-result');
-    async function refreshAccess() {
+    // Pending registrations: load list + wire approve/reject
+    const regList = $('#reg-list');
+    async function loadRegistrations() {
+      if (!regList) return;
       try {
-        const data = await api('/api/access');
-        if (wlTextarea) wlTextarea.value = (data.whitelist || []).join('\n');
-        if (blTextarea) blTextarea.value = (data.blacklist || []).join('\n');
-        if (accessStatus) {
-          const on = data.allowlistActive;
-          accessStatus.textContent = on
-            ? `Allowlist mode: ON — only ${data.whitelist.length} whitelisted number(s) can chat. All others are blocked.`
-            : 'Allowlist mode: OFF — everyone can chat except blacklisted numbers.';
-          accessStatus.style.color = on ? 'var(--red)' : 'var(--green)';
-        }
-        if (accessResult) accessResult.textContent = '';
-      } catch {}
-    }
-    async function saveAccessList(list_type, textarea) {
-      try {
-        const numbers = (textarea.value || '').split('\n').map(s => s.trim()).filter(Boolean);
-        // Clear current list, then add each number
-        await post('/api/access/clear', { list_type });
-        let added = 0, failed = 0;
-        for (const n of numbers) {
-          const r = await post('/api/access', { phone: n, list_type });
-          if (r.ok) added++; else failed++;
-        }
-        if (accessResult) {
-          accessResult.textContent = `${list_type === 'WHITELIST' ? 'Whitelist' : 'Blacklist'} saved: ${added} added, ${failed} invalid`;
-          accessResult.style.color = failed ? 'var(--yellow)' : 'var(--green)';
-        }
-        await refreshAccess();
+        const rows = await api('/api/registrations');
+        if (!rows.length) { regList.innerHTML = '<div style="color:var(--muted)">No pending registrations.</div>'; return; }
+        regList.innerHTML = rows.map(r => `
+          <div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--border)">
+            <div style="flex:1">
+              <div style="font-weight:600">${esc(r.wa_name || r.submitted_name || 'Unknown')}</div>
+              <div style="color:var(--muted);font-size:12px">${esc(r.phone)}</div>
+            </div>
+            <button class="btn btn-sm" style="background:var(--green);color:#fff;border:none;cursor:pointer" onclick="window._regApprove('${esc(r.chat_id)}')">Approve</button>
+            <button class="btn btn-sm" style="background:var(--red);color:#fff;border:none;cursor:pointer" onclick="window._regReject('${esc(r.chat_id)}')">Reject</button>
+          </div>`).join('');
       } catch (e) {
-        if (accessResult) { accessResult.textContent = 'Error saving: ' + (e.message || 'unknown'); accessResult.style.color = 'var(--red)'; }
+        regList.innerHTML = '<div style="color:var(--red)">Failed to load registrations.</div>';
       }
     }
-    $('#access-save-wl')?.addEventListener('click', () => saveAccessList('WHITELIST', wlTextarea));
-    $('#access-save-bl')?.addEventListener('click', () => saveAccessList('BLACKLIST', blTextarea));
-    refreshAccess();
+    window._regApprove = async (chatId) => {
+      try { const r = await post(`/api/registrations/${encodeURIComponent(chatId)}/approve`, {}); if (r.ok) toast('Registered ' + chatId); await loadRegistrations(); }
+      catch (e) { toast('Approve failed: ' + (e.message || 'error'), 'error'); }
+    };
+    window._regReject = async (chatId) => {
+      if (!confirm('Permanently drop this contact and all its data?')) return;
+      try { const r = await post(`/api/registrations/${encodeURIComponent(chatId)}/reject`, {}); if (r.ok) toast('Rejected & dropped ' + chatId); await loadRegistrations(); }
+      catch (e) { toast('Reject failed: ' + (e.message || 'error'), 'error'); }
+    };
+    loadRegistrations();
 
     // Wire up import button and file upload
     const importBtn = $('#import-btn');
