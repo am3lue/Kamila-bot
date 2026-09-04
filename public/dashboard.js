@@ -5,6 +5,17 @@
   const $ = (s, p) => (p || document).querySelector(s);
   const $$ = (s, p) => [...(p || document).querySelectorAll(s)];
   const esc = (s) => { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; };
+  function renderMd(text) {
+    if (!text) return '';
+    let out = esc(text);
+    out = out.replace(/```([\s\S]*?)```g, '<pre class="md-code-block"><code>$1</code></pre>');
+    out = out.replace(/`([^`]+)`/g, '<code class="md-inline-code">$1</code>');
+    out = out.replace(/\*([^*]+)\*/g, '<strong>$1</strong>');
+    out = out.replace(/_([^_]+)_/g, '<em>$1</em>');
+    out = out.replace(/~([^~]+)~/g, '<del>$1</del>');
+    out = out.replace(/\n/g, '<br>');
+    return out;
+  }
   const apiKey = () => localStorage.getItem('kamila_api_key') || '';
   let shown401Toast = false;
   function apiErr(r, msg) {
@@ -153,7 +164,10 @@
         <div class="card"><div class="stat-label">Active Contacts</div><div class="stat-value" id="s-contacts">-</div></div>
         <div class="card"><div class="stat-label">Total Messages</div><div class="stat-value" id="s-messages">-</div></div>
         <div class="card"><div class="stat-label">Open Tasks</div><div class="stat-value" id="s-tasks">-</div></div>
-        <div class="card"><div class="stat-label">Needs Human Help</div><div class="stat-value" id="s-help">-</div></div>
+        <div class="card clickable-card" onclick="location.hash='#/chats'" style="cursor:pointer"><div class="stat-label">Needs Human Help</div><div class="stat-value" id="s-help">-</div></div>
+      </div>
+      <div class="card-grid card-grid-3" style="margin-bottom:16px">
+        <div class="card"><div class="section-title">Feedback</div><div id="s-feedback" style="font-size:28px;font-weight:700">-</div><div id="s-feedback-detail" style="font-size:12px;color:var(--text-muted);margin-top:4px"></div></div>
       </div>
       <div class="card-grid card-grid-2" style="margin-bottom:16px">
         <div class="card"><div class="section-title">Messages (14 days)</div><div class="chart-wrap"><canvas id="chart-volume"></canvas></div></div>
@@ -223,12 +237,26 @@
     if (!evals.length) { wrap.innerHTML = '<div class="empty-state">No evaluations yet</div>'; return; }
     wrap.innerHTML = `<table class="eval-table"><thead><tr><th>Chat</th><th>Score</th><th>Sentiment</th><th>Help?</th><th>Summary</th></tr></thead><tbody>${evals.slice(0, 20).map(e => `
       <tr>
-        <td>${esc(e.chat_id)}</td>
+        <td><a href="#/chats" class="eval-chat-link" onclick="window._jumpToChat('${esc(e.chat_id)}');return false;" title="Open chat">${esc(e.chat_id)}</a></td>
         <td>${e.resolution_score}/10</td>
         <td class="sentiment-${e.sentiment?.[0] || 'neu'}">${esc(e.sentiment || '-')}</td>
         <td>${e.needs_human_help ? '<span style="color:var(--red)">Yes</span>' : 'No'}</td>
         <td>${esc((e.summary || '').slice(0, 80))}</td>
       </tr>`).join('')}</tbody></table>`;
+
+    // Feedback stats
+    try {
+      const fbStats = await api('/api/feedback/stats');
+      const fbEl = $('#s-feedback');
+      const fbDetail = $('#s-feedback-detail');
+      if (fbStats.length && fbEl) {
+        const totalFb = fbStats.reduce((s, f) => s + f.count, 0);
+        const avgFb = fbStats.reduce((s, f) => s + f.avg_rating, 0) / fbStats.length;
+        fbEl.textContent = `${totalFb}`;
+        fbDetail.textContent = `Avg: ${avgFb > 0 ? '+' : ''}${avgFb.toFixed(1)} across ${fbStats.length} chats`;
+        fbEl.style.color = avgFb > 0 ? 'var(--green)' : avgFb < 0 ? 'var(--red)' : 'var(--text)';
+      }
+    } catch {}
   }
 
   // ══════════════════════════════════
@@ -348,8 +376,14 @@
     if (!msgs.length) { el.innerHTML = '<div class="empty-state">No messages yet</div>'; return; }
     el.innerHTML = msgs.map(m => `
       <div class="msg-bubble ${m.is_ai ? 'msg-ai' : 'msg-user'}">
-        <div>${esc(m.text)}</div>
-        <div class="msg-meta">${m.is_ai ? 'Kamila' : 'User'} · ${timeAgo(m.timestamp)}</div>
+        <div class="msg-text">${m.is_ai ? renderMd(m.text) : esc(m.text)}</div>
+        <div class="msg-meta">
+          <span>${m.is_ai ? 'Kamila' : 'User'} · ${timeAgo(m.timestamp)}</span>
+          ${m.is_ai ? `<span class="feedback-btns" data-ts="${m.timestamp}">
+            <button class="fb-btn fb-up" onclick="window._giveFeedback('${esc(chatId)}',${m.timestamp},1,this)" title="Helpful">&#128077;</button>
+            <button class="fb-btn fb-down" onclick="window._giveFeedback('${esc(chatId)}',${m.timestamp},-1,this)" title="Not helpful">&#128078;</button>
+          </span>` : ''}
+        </div>
       </div>`).join('');
     el.scrollTop = el.scrollHeight;
   }
@@ -382,9 +416,34 @@
     if (r.ok) { toast('Draft discarded', 'info'); loadDraftArea(selectedChat); }
   };
 
-  window._jumpToChat = (chatId) => {
+  window._giveFeedback = async (chatId, ts, rating, btn) => {
+    try {
+      const r = await post('/api/feedback', { chatId, messageTs: ts, rating });
+      if (r.ok) {
+        // Mark the clicked button, disable both
+        const container = btn.closest('.feedback-btns');
+        if (container) {
+          container.querySelectorAll('.fb-btn').forEach(b => { b.disabled = true; b.style.opacity = '0.4'; });
+          btn.style.opacity = '1';
+          btn.classList.add('fb-active');
+        }
+        toast(rating > 0 ? 'Marked helpful' : 'Marked not helpful', 'success');
+      }
+    } catch (e) { toast('Feedback failed', 'error'); }
+  };
+
+  window._jumpToChat = async (chatId) => {
     selectedChat = chatId;
     saveState('selectedChat', chatId);
+    if (location.hash !== '#/chats') {
+      location.hash = '#/chats';
+      // Wait for chats view to render
+      await new Promise(r => setTimeout(r, 100));
+    }
+    // Select the chat
+    const c = allContacts.find(x => x.phone_number === chatId);
+    if (c) selectChat(c.phone_number, c.name);
+    else selectChat(chatId, chatId);
   };
 
   async function sendManualReply() {
