@@ -8,7 +8,7 @@
   function renderMd(text) {
     if (!text) return '';
     let out = esc(text);
-    out = out.replace(/```([\s\S]*?)```g, '<pre class="md-code-block"><code>$1</code></pre>');
+    out = out.replace(/```([\s\S]*?)```/g, '<pre class="md-code-block"><code>$1</code></pre>');
     out = out.replace(/`([^`]+)`/g, '<code class="md-inline-code">$1</code>');
     out = out.replace(/\*([^*]+)\*/g, '<strong>$1</strong>');
     out = out.replace(/_([^_]+)_/g, '<em>$1</em>');
@@ -235,13 +235,14 @@
     const evals = await api('/api/evaluations');
     const wrap = $('#eval-table-wrap');
     if (!evals.length) { wrap.innerHTML = '<div class="empty-state">No evaluations yet</div>'; return; }
-    wrap.innerHTML = `<table class="eval-table"><thead><tr><th>Chat</th><th>Score</th><th>Sentiment</th><th>Help?</th><th>Summary</th></tr></thead><tbody>${evals.slice(0, 20).map(e => `
+    wrap.innerHTML = `<table class="eval-table"><thead><tr><th>Chat</th><th>Score</th><th>Sentiment</th><th>Help?</th><th>Summary</th><th></th></tr></thead><tbody>${evals.slice(0, 20).map(e => `
       <tr>
         <td><a href="#/chats" class="eval-chat-link" onclick="window._jumpToChat('${esc(e.chat_id)}');return false;" title="Open chat">${esc(e.chat_id)}</a></td>
         <td>${e.resolution_score}/10</td>
         <td class="sentiment-${e.sentiment?.[0] || 'neu'}">${esc(e.sentiment || '-')}</td>
         <td>${e.needs_human_help ? '<span style="color:var(--red)">Yes</span>' : 'No'}</td>
         <td>${esc((e.summary || '').slice(0, 80))}</td>
+        <td>${e.needs_human_help ? `<button class="btn btn-sm" onclick="window._resolveChat('${esc(e.chat_id)}')">Resume AI</button>` : ''}</td>
       </tr>`).join('')}</tbody></table>`;
 
     // Feedback stats
@@ -430,6 +431,21 @@
         toast(rating > 0 ? 'Marked helpful' : 'Marked not helpful', 'success');
       }
     } catch (e) { toast('Feedback failed', 'error'); }
+  };
+
+  window._resolveChat = async (chatId) => {
+    const btn = [...document.querySelectorAll('button')].find(b => b.textContent === 'Resume AI');
+    try {
+      const r = await post('/api/evaluate/resolve', { chatId });
+      if (r.ok) {
+        toast('AI resumed for ' + chatId);
+        await loadOverviewData();
+      } else {
+        toast('Resolve failed: ' + (r.error || 'unknown error'), 'error');
+      }
+    } catch (e) {
+      toast('Resolve failed: ' + (e.message || 'network error'), 'error');
+    }
   };
 
   window._jumpToChat = async (chatId) => {

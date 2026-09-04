@@ -30,6 +30,25 @@ export function formatForWhatsApp(text) {
 }
 
 /**
+ * Clarity-aware hard word cap. Only truncates when a reply exceeds n words.
+ * Preserves short replies untouched and ends on a clean word boundary so
+ * messages never read as awkwardly chopped mid-thought.
+ */
+export function enforceWordCap(text, n = 10) {
+  if (!text || typeof text !== 'string') return '';
+  const words = text.trim().split(/\s+/);
+  const len = words.length;
+  if (len <= n) return text.trim();
+  const kept = words.slice(0, n).join(' ');
+  const cutPos = kept.length;
+  const after = text.trim().slice(cutPos);
+  const cutMidWord = /[A-Za-z0-9]$/.test(kept) && /^[A-Za-z0-9]/.test(after);
+  let out = kept.replace(/[\s,.;:!?]+$/, '');
+  if (cutMidWord) out += '…';
+  return out;
+}
+
+/**
  * Convert WhatsApp/markdown text to safe HTML for the dashboard.
  * Handles: *bold*, _italic_, ~strikethrough~, `code`, ```code blocks```
  */

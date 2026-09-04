@@ -10,7 +10,7 @@ import axios from 'axios';
 import { EventEmitter } from 'events';
 import logger from './utils/logger.js';
 import { initMemoryTable, prepareMemoryStmts, buildMemoryContext, maybeUpdateMemory, getMemoryStats } from './utils/memory.js';
-import { formatForWhatsApp } from './utils/markdown.js';
+import { formatForWhatsApp, enforceWordCap } from './utils/markdown.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -30,6 +30,13 @@ const {
 
 const MAX_MSG_LEN = 2000;
 const MAX_WHATSAPP_LEN = 4000;
+
+// Handoff messages used when a chat is flagged needs-human-help (AI stays paused until resolved)
+const HANDOFF_EN = 'Sorry Pal Cant Continue, let Him Resolve this ...';
+const HANDOFF_SW = 'Samahani Siwezi Kukusaidia, Suburi Anakuja Kukusaidia';
+const HANDOFF_RESEND_MS = 10 * 60 * 1000; // re-send handoff at most once per 10 min while paused
+const swahiliHints = ['niambie', 'mambo', 'vipi', 'mzee', 'habari', 'sawa', 'poa', 'pole', 'rafiki', 'kaka', 'dada', 'nini', 'hapana', 'ndio', 'asante', 'karibu', 'kesho', 'leo', 'yaani', 'kweli', 'sasa', 'kwa', 'nimechoka', 'nimekasirika', 'wewe', 'mimi', 'unataka', 'usijali', 'sina', 'nikoe', 'hapa', 'tafadhali'];
+const pausedHandoffSent = new Map(); // chatId -> last handoff timestamp
 
 // ── Database ──
 
@@ -116,6 +123,7 @@ const stmts = {
   getAllTasks: db.prepare(`SELECT * FROM tasks ORDER BY CASE urgency WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 ELSE 3 END`),
   completeTask: db.prepare(`UPDATE tasks SET status = 'DONE' WHERE id = ?`),
   upsertEvaluation: db.prepare(`INSERT OR REPLACE INTO evaluations (chat_id, resolution_score, sentiment, needs_human_help, summary, last_updated) VALUES (?, ?, ?, ?, ?, unixepoch())`),
+  resolveEvaluation: db.prepare(`UPDATE evaluations SET needs_human_help = 0, last_updated = unixepoch() WHERE chat_id = ?`),
   getEvaluation: db.prepare(`SELECT * FROM evaluations WHERE chat_id = ?`),
   getAllEvaluations: db.prepare(`SELECT * FROM evaluations ORDER BY last_updated DESC`),
   getChatsNeedingHelp: db.prepare(`SELECT * FROM evaluations WHERE needs_human_help = 1`),
@@ -357,6 +365,12 @@ function splitMessage(text) {
   return chunks;
 }
 
+function detectSwahili(text) {
+  if (!text) return false;
+  const lower = text.toLowerCase();
+  return swahiliHints.some((w) => lower.includes(w));
+}
+
 function checkRateLimit(userId) {
   const now = Date.now();
   const last = userRateLimit.get(userId) || 0;
@@ -517,6 +531,22 @@ client.on('message', async (msg) => {
     if (!checkRateLimit(msg.from)) return;
     if (mode === 'OFF') return;
 
+    // Stop-until-resolved gate: if this chat is flagged needs-human-help, do NOT run AI.
+    // Stay paused (silent after the first handoff) until Francis resolves the flag.
+    const evalRow = stmts.getEvaluation.get(chatId);
+    if (evalRow?.needs_human_help === 1) {
+      const lastSent = pausedHandoffSent.get(chatId) || 0;
+      if (Date.now() - lastSent >= HANDOFF_RESEND_MS) {
+        const handoff = detectSwahili(body) ? HANDOFF_SW : HANDOFF_EN;
+        pausedHandoffSent.set(chatId, Date.now());
+        stmts.insertMessage.run(chatId, 'kamila', handoff, 1);
+        broadcast('message', { chatId });
+        try { await msg.reply(handoff); } catch (e) { logger.warn('Bot', `Handoff send failed: ${e.message}`); }
+      }
+      logger.info('Bot', `Chat ${chatId} is flagged needs-human-help — AI paused`);
+      return;
+    }
+
     try {
       const chat = await msg.getChat();
       await chat.sendStateTyping();
@@ -533,8 +563,8 @@ client.on('message', async (msg) => {
     if (memoryCtx) ollamaMessages.unshift(memoryCtx);
 
     const aiReplyRaw = await callOllama(ollamaMessages);
-    // Format for WhatsApp: convert markdown to WhatsApp-native formatting
-    const aiReply = formatForWhatsApp(aiReplyRaw);
+    // Format for WhatsApp: convert markdown to WhatsApp-native formatting, hard-cap to 10 words
+    const aiReply = enforceWordCap(formatForWhatsApp(aiReplyRaw));
 
     if (mode === 'DRAFT') {
       const draftRow = stmts.insertDraft.run(chatId, msg.from, aiReply);
@@ -812,6 +842,18 @@ app.post('/api/evaluate', async (req, res) => {
     return res.status(400).json({ error: 'chatId required (string)' });
   await evaluateConversation(chatId);
   await extractTasks(chatId);
+  res.json({ ok: true });
+});
+
+// Francis clears the flag on a chat — AI resumes normal replies
+app.post('/api/evaluate/resolve', async (req, res) => {
+  const { chatId } = req.body;
+  if (!chatId || typeof chatId !== 'string')
+    return res.status(400).json({ error: 'chatId required (string)' });
+  stmts.resolveEvaluation.run(chatId);
+  pausedHandoffSent.delete(chatId);
+  broadcast('eval', { chatId });
+  logger.info('Bot', `Chat ${chatId} resolved by Francis — AI resumed`);
   res.json({ ok: true });
 });
 
