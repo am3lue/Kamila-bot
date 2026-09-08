@@ -19,18 +19,25 @@ against the **current working tree** shows most are already resolved (XSS, Tailw
 .gitignore, body-parser, security headers, input validation, drafts table, SSE).
 
 This plan covers the **genuinely still-open** items, plus new findings from a re-review of the
-current code. It uses a conservative, low-risk approach suitable for a local single-PC tool.
+current code (2026-09-03, commit `a2f344b`: 0 CRITICAL / 3 HIGH / 8 MED / 6 LOW — all folded into
+WS-1..WS-8, see §8 note). It uses a conservative, low-risk approach suitable for a local
+single-PC tool.
 
 ---
 
 ## 1. Snapshot used for this plan
 
-- `server.js` — 878 lines, `app.listen(PORT)` binds `0.0.0.0` (line 230). Auth via optional
-  `API_KEY` header (also accepts `?key=` query) + CSRF same-origin check + manual security headers.
-  SSE `sseClients` is an unbounded `Set` with no heartbeat. Ollama uses linear retry, no circuit
-  breaker. `evaluateConversation`/`extractTasks` fired via bare `setTimeout`. Model:
-  `better-sqlite3@13.0.3`.
-- `public/dashboard.js` — 827 lines; `esc()`-safe rendering; API key in `localStorage`.
+> **Refreshed 2026-09-03T09:25** after a fresh reviewer pass (commit `a2f344b`, access control +
+> auth fix). The `?key=` query fallback and the `countTable`/auth structure have since changed.
+
+- `server.js` — **898 lines**, `app.listen(PORT)` binds `0.0.0.0` (line 230). Auth via optional
+  `API_KEY` header **only** (`?key=` query now removed) + CSRF same-origin check (hostname-based)
+  + manual security headers. SSE `sseClients` is an unbounded `Set` with no heartbeat. Ollama uses
+  linear retry (3×30s), no circuit breaker. `evaluateConversation`/`extractTasks` fired via bare
+  `setTimeout`. `sanitizeInput` is a basic prompt-injection filter (documented as non-security).
+  Model: `better-sqlite3@13.0.3`.
+- `public/dashboard.js` — **855 lines**; `esc()`-safe rendering (one `innerHTML` in broadcast);
+  API key in `localStorage`.
 - `bot.js` — **deleted**. `src/` dir — **does not exist** (monolith remains).
 - No tests, no test scripts. `.gitignore` present and good.
 
@@ -99,12 +106,20 @@ header (prevents key leakage in URLs/logs/referrers).
     `setImmediate` serialisation. **No new dependency** (per no-deps rule) unless the user allows
     `p-queue`.
   - Wrap each job in try/finally so a failure can't wedge the counter.
+- **MED-1 (error isolation):** ensure `evaluateConversation` and `extractTasks` are each wrapped
+  in their own `try/catch` so a throw in one does not skip the other:
+  ```js
+  setTimeout(async () => {
+    try { await evaluateConversation(chatId); } catch (e) { log.error(e); }
+    try { await extractTasks(chatId); } catch (e) { log.error(e); }
+  }, EVAL_DELAY_MS);
+  ```
 - Verification: `node --check`; send a test message and observe eval/task jobs run without
-  overlapping beyond the cap.
+  overlapping beyond the cap; force an eval throw to confirm `extractTasks` still runs.
 
 ### WS-4 — Name the magic numbers (maintainability)
 **File:** `server.js` (+ `dashboard.js` where shared)
-- Extract to named constants near the top:
+- Extract to named constants near the top (MED-6 + LOW-2):
   - `MIN_EVAL_MESSAGES = 3`, `CONTEXT_WINDOW_SIZE = 10`, `MAX_RECENT_MESSAGES = 50`,
     `TYPING_DELAY_MIN_MS = 1500`, `TYPING_DELAY_MAX_MS = 8000`, `TYPING_DELAY_PER_CHAR_MS = 40`,
     `EVAL_DELAY_MS = 5000`, `RATE_LIMIT_CLEANUP_CUTOFF_MS = 3600000`, `RATE_LIMIT_CLEANUP_INTERVAL_MS = 600000`.
@@ -123,8 +138,19 @@ header (prevents key leakage in URLs/logs/referrers).
   ```
 - Replace noisy `console.log/error` in the bot message handler and Ollama path with `log.…`.
   Keep the error-path detail logging but route through `log.error`.
+- **HIGH-1 (do not log conversation payloads):** replace the verbose bot-error dump
+  (`console.error('[Bot] Error:', err, err.config, err.config.data, ...)`) with a **trimmed**
+  version logging only essentials — `err.message`, `err.code`, and `err.response?.status` — and
+  **removing `err.config.data`** (the full Ollama payload contains conversation transcripts).
+  Guard against logging the HTTP `config` object entirely:
+  ```js
+  log.error('[Bot] Error:', err.message, err.code);
+  if (err.response) log.error('[Bot] HTTP', err.response.status);
+  // do NOT log err.config / err.config.data
+  ```
+  Also route this through `log.error` so `LOG_LEVEL` can suppress it in production.
 - Verification: `node --check`; run with `LOG_LEVEL=silent` and confirm info/warn suppressed,
-  errors still shown.
+  errors still shown; trigger an Ollama failure and confirm the transcript is **not** printed.
 
 ### WS-6 — node:test suite (regression safety)
 **Files (new):** `src/lib.js`, `test/*.test.js`, plus `"test": "node --test"` script in `package.json`.
@@ -166,6 +192,35 @@ header (prevents key leakage in URLs/logs/referrers).
 - Verification: with Ollama stopped, send a message → after threshold the breaker trips and the
   bot fails fast instead of 3×30s timeouts; restart Ollama → auto-recovers.
 
+### WS-8 — Access-control hardening + dashboard consistency (new, from 2026-09-03 re-review)
+**Files:** `server.js`, `public/dashboard.js`
+- **MED-2 (auth on access endpoints):** `/api/access` GET/POST currently pass through
+  `requireAuth` only when `REQUIRE_AUTH` is set. Because access controls (whitelist/blacklist)
+  gate who may message the bot, gate these endpoints behind auth **even when `REQUIRE_AUTH` is
+  off**, or document the trust model in the README (currently open by design for
+  LAN/local-only). Prefer: always require the key for `/api/access` mutating calls.
+- **MED-3 (correct `/api/config`):** replace the hardcoded `hasApiKey: false` with the real value
+  (`hasApiKey: !!process.env.API_KEY`). The client uses this to toggle UI states, so a wrong value
+  is misleading.
+- **MED-4 (N+1 access-list save):** `saveAccessList` clears the list then issues **one POST per
+  number** (`51` requests for 50 numbers). Add a bulk endpoint `POST /api/access/bulk`
+  `{ numbers: [], list_type }` and batch server-side in one transaction (reuse
+  `addAccessIfMissing` logic with `ON CONFLICT DO NOTHING`). Update the client to call it once.
+- **MED-8 (broadcast `innerHTML`):** the broadcast result renderer uses
+  `result.innerHTML = 'Sent: <strong>' + res.sent + ...` . Values are server-controlled (low
+  risk) but inconsistent with the `esc()` pattern used elsewhere; switch to `esc()`/`textContent`.
+- **MED-5 (sanitizeInput footprint):** `sanitizeInput` is a **basic** prompt-injection filter and
+  must not be treated as a security boundary (bypassable via Unicode/whitespace/phrasing). Add a
+  code comment + README note; defense-in-depth lives in the Ollama system prompt. No behaviour
+  change.
+- **LOW-1/2/3/4:** (a) replace `✅`/`❌` console markers with `[OK]`/`[FAIL]` for terminal-safety;
+  (b) tested in WS-4 (`MIN_EVAL_MESSAGES`); (c) update dashboard.js "uses `?key` or header" wording
+  to reference only the header (test message is stale); (d) document that CSRF origin check trusts
+  any private IP (LAN trust model) in the README.
+- Verification: `node --check server.js` + `node --check public/dashboard.js`; access save is a
+  single bulk call; `/api/config` returns the real `hasApiKey`; broadcast still renders escaped
+  output.
+
 ---
 
 ## 5. Out of scope (already done, or noise)
@@ -181,12 +236,12 @@ header (prevents key leakage in URLs/logs/referrers).
 
 | File | Change |
 |---|---|
-| `server.js` | WS-1, WS-2, WS-3, WS-4, WS-5, WS-6 (import lib), WS-7 (circuit breaker) |
+| `server.js` | WS-1, WS-2, WS-3, WS-4, WS-5, WS-6 (import lib), WS-7 (circuit breaker), WS-8 (access auth, config, logging trim) |
 | `src/lib.js` (new) | WS-6 — pure helpers extracted |
 | `test/*.test.js` (new) | WS-6 |
 | `package.json` | WS-6 `"test": "node --test"` |
 | `.env.example` | WS-5 optional `LOG_LEVEL` line |
-| `dashboard.js` | only if WS-4 constants shared (minor) |
+| `dashboard.js` | WS-4 (constants), WS-8 (bulk save, broadcast esc, test-message wording) |
 
 ## 7. Verification
 
@@ -204,6 +259,14 @@ header (prevents key leakage in URLs/logs/referrers).
    its Less Internet required".
 2. **WS-7** — ✅ **Include the Ollama circuit breaker now** (no new dependency).
 3. **WS-6** — ✅ **Extract `src/lib.js`** (pure helpers only, not the full module split).
+4. **WS-8** — ✅ **New workstream (2026-09-03 re-review):** access-endpoint auth, bulk access save,
+   real `hasApiKey`, trimmed error logs (HIGH-1), broadcast `esc()`, sanitizeInput doc.
+
+> **Re-review verdict (2026-09-03, commit `a2f344b`):** 0 CRITICAL, 3 HIGH, 8 MED, 6 LOW. All
+> HIGH/MED/low items are captured above: HIGH-2→WS-2, HIGH-3→WS-7, HIGH-1→WS-5; MED-1→WS-3,
+> MED-6→WS-4, MED-7→WS-6, MED-2/3/4/5/8→WS-8; LOW-2→WS-4, LOW-1/3/4→WS-8, LOW-5 noted.
+> Nothing blocks merge before the existing WS-1..WS-7 work; recommended first: WS-3 error
+> isolation, WS-8 `hasApiKey`, WS-5 logging trim.
 
 ---
 

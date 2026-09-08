@@ -7,3 +7,4 @@ node_modules/
 .wwebjs_cache/
 logs/
 *.vcf
+

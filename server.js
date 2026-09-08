@@ -8,6 +8,9 @@ const { Client, LocalAuth } = pkg;
 import qrcode from 'qrcode-terminal';
 import axios from 'axios';
 import { EventEmitter } from 'events';
+import logger from './utils/logger.js';
+import { initMemoryTable, prepareMemoryStmts, buildMemoryContext, maybeUpdateMemory, getMemoryStats } from './utils/memory.js';
+import { formatForWhatsApp, enforceWordCap } from './utils/markdown.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -21,12 +24,20 @@ const {
   PUPPETEER_HEADLESS = 'true',
   PUPPETEER_ARGS = '--no-sandbox,--disable-setuid-sandbox',
   DB_PATH = './kamila.db',
-  WHITELIST = '',
-  BLACKLIST = '',
+  // Access lists disabled (kept for recovery).
+  // WHITELIST = '',
+  // BLACKLIST = '',
 } = process.env;
 
 const MAX_MSG_LEN = 2000;
 const MAX_WHATSAPP_LEN = 4000;
+
+// Handoff messages used when a chat is flagged needs-human-help (AI stays paused until resolved)
+const HANDOFF_EN = 'Sorry Pal Cant Continue, let Him Resolve this ...';
+const HANDOFF_SW = 'Samahani Siwezi Kukusaidia, Suburi Anakuja Kukusaidia';
+const HANDOFF_RESEND_MS = 10 * 60 * 1000; // re-send handoff at most once per 10 min while paused
+const swahiliHints = ['niambie', 'mambo', 'vipi', 'mzee', 'habari', 'sawa', 'poa', 'pole', 'rafiki', 'kaka', 'dada', 'nini', 'hapana', 'ndio', 'asante', 'karibu', 'kesho', 'leo', 'yaani', 'kweli', 'sasa', 'kwa', 'nimechoka', 'nimekasirika', 'wewe', 'mimi', 'unataka', 'usijali', 'sina', 'nikoe', 'hapa', 'tafadhali'];
+const pausedHandoffSent = new Map(); // chatId -> last handoff timestamp
 
 // ── Database ──
 
@@ -38,7 +49,18 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS contacts (
     phone_number TEXT PRIMARY KEY,
     name TEXT,
-    auto_reply_mode TEXT CHECK(auto_reply_mode IN ('AUTO','DRAFT','OFF')) DEFAULT 'AUTO'
+    auto_reply_mode TEXT CHECK(auto_reply_mode IN ('AUTO','DRAFT','OFF')) DEFAULT 'AUTO',
+    wa_name TEXT,
+    on_whatsapp INTEGER DEFAULT 1,
+    registered INTEGER DEFAULT 0,
+    source TEXT DEFAULT 'import'
+  );
+  CREATE TABLE IF NOT EXISTS registrations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id TEXT NOT NULL UNIQUE,
+    submitted_name TEXT,
+    status TEXT CHECK(status IN ('PENDING','APPROVED','REJECTED')) DEFAULT 'PENDING',
+    created_at INTEGER DEFAULT (unixepoch())
   );
   CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -71,28 +93,69 @@ db.exec(`
     text TEXT NOT NULL,
     created_at INTEGER DEFAULT (unixepoch())
   );
-  CREATE TABLE IF NOT EXISTS access (
-    phone_number TEXT PRIMARY KEY,
-    list_type TEXT CHECK(list_type IN ('WHITELIST','BLACKLIST')) NOT NULL
+  CREATE TABLE IF NOT EXISTS feedback (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id TEXT NOT NULL,
+    message_ts INTEGER,
+    rating INTEGER CHECK(rating IN (-1, 1)),
+    comment TEXT,
+    created_at INTEGER DEFAULT (unixepoch())
   );
 `);
+// ── Idempotent migration: add columns to existing contacts table ──
+(function migrateContactsColumns() {
+  try {
+    const cols = db.prepare(`PRAGMA table_info(contacts)`).all().map((c) => c.name);
+    const add = (name, ddl) => { if (!cols.includes(name)) db.exec(`ALTER TABLE contacts ADD COLUMN ${ddl}`); };
+    add('wa_name', `wa_name TEXT`);
+    add('on_whatsapp', `on_whatsapp INTEGER DEFAULT 1`);
+    add('registered', `registered INTEGER DEFAULT 0`);
+    add('source', `source TEXT DEFAULT 'import'`);
+  } catch (err) {
+    console.error('Migration failed (contacts columns):', err.message);
+  }
+})();
+// ── Set existing never-chatted contacts to OFF (per host: all contacts OFF until engaged) ──
+(function migrateNeverChattedToOff() {
+  try {
+    db.exec(`UPDATE contacts SET auto_reply_mode = 'OFF' WHERE auto_reply_mode = 'AUTO' AND phone_number NOT IN (SELECT DISTINCT chat_id FROM messages)`);
+  } catch (err) {
+    console.error('Migration failed (OFF default):', err.message);
+  }
+})();
+// ── Ensure UNIQUE on registrations.chat_id so ON CONFLICT(chat_id) resolves ──
+db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_registrations_chat ON registrations(chat_id)`);
+initMemoryTable(db);
+const memStmts = prepareMemoryStmts(db);
 
 const stmts = {
-  upsertContact: db.prepare(`INSERT INTO contacts (phone_number, name) VALUES (?, ?) ON CONFLICT(phone_number) DO UPDATE SET name = CASE WHEN excluded.name = '' THEN contacts.name ELSE excluded.name END`),
+  upsertContact: db.prepare(`INSERT INTO contacts (phone_number, name, source, on_whatsapp) VALUES (?, ?, 'import', 1) ON CONFLICT(phone_number) DO UPDATE SET name = CASE WHEN excluded.name = '' THEN contacts.name ELSE excluded.name END`),
   upsertContactBatch: db.prepare(`INSERT INTO contacts (phone_number, name) VALUES (@phone, @name) ON CONFLICT(phone_number) DO UPDATE SET name = CASE WHEN excluded.name = '' THEN contacts.name ELSE excluded.name END`),
+  upsertContactFromChat: db.prepare(`INSERT INTO contacts (phone_number, name, source, on_whatsapp, auto_reply_mode) VALUES (?, ?, 'chat', 1, 'AUTO') ON CONFLICT(phone_number) DO UPDATE SET name = CASE WHEN excluded.name = '' THEN contacts.name ELSE excluded.name END`),
   getContact: db.prepare(`SELECT * FROM contacts WHERE phone_number = ?`),
   setContactMode: db.prepare(`UPDATE contacts SET auto_reply_mode = ? WHERE phone_number = ?`),
-  // Access control (whitelist / blacklist)
-  getAccessType: db.prepare(`SELECT list_type FROM access WHERE phone_number = ?`),
-  getWhitelist: db.prepare(`SELECT phone_number FROM access WHERE list_type = 'WHITELIST' ORDER BY phone_number`),
-  getBlacklist: db.prepare(`SELECT phone_number FROM access WHERE list_type = 'BLACKLIST' ORDER BY phone_number`),
-  allAccess: db.prepare(`SELECT phone_number, list_type FROM access ORDER BY list_type, phone_number`),
-  getWhitelistCount: db.prepare(`SELECT COUNT(*) AS n FROM access WHERE list_type = 'WHITELIST'`),
-  addAccess: db.prepare(`INSERT INTO access (phone_number, list_type) VALUES (?, ?) ON CONFLICT(phone_number) DO UPDATE SET list_type = excluded.list_type`),
-  addAccessIfMissing: db.prepare(`INSERT INTO access (phone_number, list_type) VALUES (?, ?) ON CONFLICT(phone_number) DO NOTHING`),
-  removeAccess: db.prepare(`DELETE FROM access WHERE phone_number = ?`),
-  clearAccess: db.prepare(`DELETE FROM access WHERE list_type = ?`),
+  setOnWhatsapp: db.prepare(`UPDATE contacts SET on_whatsapp = ? WHERE phone_number = ?`),
+  setWaName: db.prepare(`UPDATE contacts SET wa_name = ?, name = CASE WHEN ? = '' THEN name ELSE ? END WHERE phone_number = ?`),
+  dropContact: db.prepare(`DELETE FROM contacts WHERE phone_number = ?`),
+  // Access control (whitelist / blacklist) — DISABLED, kept for recovery.
+  // getAccessType: db.prepare(`SELECT list_type FROM access WHERE phone_number = ?`),
+  // getWhitelist: db.prepare(`SELECT phone_number FROM access WHERE list_type = 'WHITELIST' ORDER BY phone_number`),
+  // getBlacklist: db.prepare(`SELECT phone_number FROM access WHERE list_type = 'BLACKLIST' ORDER BY phone_number`),
+  // allAccess: db.prepare(`SELECT phone_number, list_type FROM access ORDER BY list_type, phone_number`),
+  // getWhitelistCount: db.prepare(`SELECT COUNT(*) AS n FROM access WHERE list_type = 'WHITELIST'`),
+  // addAccess: db.prepare(`INSERT INTO access (phone_number, list_type) VALUES (?, ?) ON CONFLICT(phone_number) DO UPDATE SET list_type = excluded.list_type`),
+  // addAccessIfMissing: db.prepare(`INSERT INTO access (phone_number, list_type) VALUES (?, ?) ON CONFLICT(phone_number) DO NOTHING`),
+  // removeAccess: db.prepare(`DELETE FROM access WHERE phone_number = ?`),
+  // clearAccess: db.prepare(`DELETE FROM access WHERE list_type = ?`),
+  // Registration
+  insertRegistration: db.prepare(`INSERT INTO registrations (chat_id, submitted_name, status) VALUES (?, ?, 'PENDING') ON CONFLICT(chat_id) DO UPDATE SET submitted_name = excluded.submitted_name, status = 'PENDING'`),
+  getPendingRegistrations: db.prepare(`SELECT * FROM registrations WHERE status = 'PENDING' ORDER BY created_at ASC`),
+  getRegistration: db.prepare(`SELECT * FROM registrations WHERE chat_id = ?`),
+  approveRegistration: db.prepare(`UPDATE registrations SET status = 'APPROVED' WHERE chat_id = ?`),
+  rejectRegistration: db.prepare(`UPDATE registrations SET status = 'REJECTED' WHERE chat_id = ?`),
+  registerContact: db.prepare(`UPDATE contacts SET registered = 1 WHERE phone_number = ?`),
   insertMessage: db.prepare(`INSERT INTO messages (chat_id, sender, text, is_ai) VALUES (?, ?, ?, ?)`),
+  deleteMessagesByChat: db.prepare(`DELETE FROM messages WHERE chat_id = ?`),
   getMessages: db.prepare(`SELECT * FROM messages WHERE chat_id = ? ORDER BY timestamp DESC LIMIT 50`),
   getContactMessages: db.prepare(`SELECT * FROM messages WHERE chat_id = ? ORDER BY timestamp ASC`),
   getAllContacts: db.prepare(`SELECT * FROM contacts ORDER BY name ASC, phone_number ASC`),
@@ -103,6 +166,7 @@ const stmts = {
   getAllTasks: db.prepare(`SELECT * FROM tasks ORDER BY CASE urgency WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 ELSE 3 END`),
   completeTask: db.prepare(`UPDATE tasks SET status = 'DONE' WHERE id = ?`),
   upsertEvaluation: db.prepare(`INSERT OR REPLACE INTO evaluations (chat_id, resolution_score, sentiment, needs_human_help, summary, last_updated) VALUES (?, ?, ?, ?, ?, unixepoch())`),
+  resolveEvaluation: db.prepare(`UPDATE evaluations SET needs_human_help = 0, last_updated = unixepoch() WHERE chat_id = ?`),
   getEvaluation: db.prepare(`SELECT * FROM evaluations WHERE chat_id = ?`),
   getAllEvaluations: db.prepare(`SELECT * FROM evaluations ORDER BY last_updated DESC`),
   getChatsNeedingHelp: db.prepare(`SELECT * FROM evaluations WHERE needs_human_help = 1`),
@@ -125,6 +189,13 @@ const stmts = {
   getDraftById: db.prepare(`SELECT * FROM drafts WHERE id = ?`),
   deleteDraft: db.prepare(`DELETE FROM drafts WHERE id = ?`),
   deleteDraftsByChat: db.prepare(`DELETE FROM drafts WHERE chat_id = ?`),
+  // Feedback
+  insertFeedback: db.prepare(`INSERT INTO feedback (chat_id, message_ts, rating, comment) VALUES (?, ?, ?, ?)`),
+  getFeedbackByChat: db.prepare(`SELECT * FROM feedback WHERE chat_id = ? ORDER BY created_at DESC`),
+  getFeedbackStats: db.prepare(`SELECT chat_id, COUNT(*) AS count, SUM(rating) AS total, AVG(rating) AS avg_rating FROM feedback GROUP BY chat_id`),
+  getAllFeedback: db.prepare(`SELECT * FROM feedback ORDER BY created_at DESC LIMIT 100`),
+  // Messages for memory counting
+  countMessages: db.prepare(`SELECT COUNT(*) AS n FROM messages WHERE chat_id = ?`),
 };
 
 // ── Access control (whitelist / blacklist) ──
@@ -141,29 +212,30 @@ function canonicalPhone(input) {
 }
 
 // Seed access table from env boot defaults (add-only, doesn't override
-// dashboard-managed entries).
-(function seedAccessFromEnv() {
-  const seed = (list, type) => {
-    for (const raw of String(list).split(',')) {
-      const phone = canonicalPhone(raw);
-      if (phone) stmts.addAccessIfMissing.run(phone, type);
-    }
-  };
-  seed(WHITELIST, 'WHITELIST');
-  seed(BLACKLIST, 'BLACKLIST');
-})();
+// dashboard-managed entries). — DISABLED (access control removed).
+// (function seedAccessFromEnv() {
+//   const seed = (list, type) => {
+//     for (const raw of String(list).split(',')) {
+//       const phone = canonicalPhone(raw);
+//       if (phone) stmts.addAccessIfMissing.run(phone, type);
+//     }
+//   };
+//   seed(WHITELIST, 'WHITELIST');
+//   seed(BLACKLIST, 'BLACKLIST');
+// })();
 
 // Precedence: blacklist always wins. Otherwise, if a whitelist is active
 // (non-empty), only whitelisted numbers are allowed. With an empty whitelist
 // everyone not blacklisted is allowed.
-function accessAllowed(chatId) {
-  const phone = canonicalPhone(chatId);
-  if (!phone) return false;
-  const row = stmts.getAccessType.get(phone);
-  if (row?.list_type === 'BLACKLIST') return false;
-  if (row?.list_type === 'WHITELIST') return true;
-  return stmts.getWhitelistCount.get().n === 0;
-}
+// — DISABLED (access control removed; per-contact Auto/Off/Draft is the control).
+// function accessAllowed(chatId) {
+//   const phone = canonicalPhone(chatId);
+//   if (!phone) return false;
+//   const row = stmts.getAccessType.get(phone);
+//   if (row?.list_type === 'BLACKLIST') return false;
+//   if (row?.list_type === 'WHITELIST') return true;
+//   return stmts.getWhitelistCount.get().n === 0;
+// }
 
 // ── SSE Infrastructure ──
 
@@ -200,7 +272,7 @@ app.use((_req, res, next) => {
 // external API consumers. When disabled the key stays in .env for later use.
 const API_KEY = process.env.API_KEY;
 const REQUIRE_AUTH = process.env.REQUIRE_AUTH === '1' || process.env.REQUIRE_AUTH === 'true';
-if (REQUIRE_AUTH && !API_KEY) console.warn('[Security] REQUIRE_AUTH=1 but no API_KEY set — set API_KEY in .env.');
+if (REQUIRE_AUTH && !API_KEY) logger.warn('Security', 'REQUIRE_AUTH=1 but no API_KEY set — set API_KEY in .env.');
 
 function requireAuth(req, res, next) {
   if (!REQUIRE_AUTH) return next();
@@ -244,7 +316,7 @@ app.get('/api/access/remove', (_req, res) => res.status(405).json({ error: 'Use 
 app.get('/api/access/clear', (_req, res) => res.status(405).json({ error: 'Use POST' }));
 
 const httpServer = app.listen(PORT, () => {
-  console.log(`[Dashboard] http://localhost:${PORT}`);
+  logger.info('Dashboard', `Server running at http://localhost:${PORT}`);
 });
 
 // ── SSE endpoint ──
@@ -263,7 +335,7 @@ app.get('/api/events', (req, res) => {
 // ── Helpers ──
 
 const axiosInstance = axios.create({ timeout: Number(AXIOS_TIMEOUT_MS) });
-console.log(`[Config] OLLAMA_URL=${OLLAMA_URL} MODEL_NAME=${MODEL_NAME} TIMEOUT=${AXIOS_TIMEOUT_MS}ms`);
+logger.info('Config', `OLLAMA_URL=${OLLAMA_URL} MODEL_NAME=${MODEL_NAME} TIMEOUT=${AXIOS_TIMEOUT_MS}ms`);
 const userRateLimit = new Map();
 
 function sanitizeInput(text) {
@@ -337,6 +409,69 @@ function splitMessage(text) {
   return chunks;
 }
 
+function detectSwahili(text) {
+  if (!text) return false;
+  const lower = text.toLowerCase();
+  return swahiliHints.some((w) => lower.includes(w));
+}
+
+// Cascade-delete a contact and all related data (clean removal).
+function deleteContactCascade(chatId) {
+  const t = db.transaction((id) => {
+    stmts.deleteMessagesByChat.run(id);
+    db.prepare(`DELETE FROM evaluations WHERE chat_id = ?`).run(id);
+    db.prepare(`DELETE FROM tasks WHERE chat_id = ?`).run(id);
+    db.prepare(`DELETE FROM drafts WHERE chat_id = ?`).run(id);
+    db.prepare(`DELETE FROM feedback WHERE chat_id = ?`).run(id);
+    db.prepare(`DELETE FROM registrations WHERE chat_id = ?`).run(id);
+    db.prepare(`DELETE FROM conversations WHERE chat_id = ?`).run(id);
+    return stmts.dropContact.run(id);
+  });
+  return t(chatId);
+}
+
+// Reconcile local contacts against the live WhatsApp contact book:
+//  - matched numbers  -> on_whatsapp=1, wa_name set, name = WhatsApp name (WhatsApp wins)
+//  - unmatched numbers -> on_whatsapp=0 (drop candidates)
+//  - dropOnly=true     -> permanently delete unmatched contacts (cascade)
+async function reconcileContacts({ dropOnly = false } = {}) {
+  const waMap = new Map();
+  try {
+    const wa = await client.getContacts();
+    for (const c of wa) {
+      if (c.isWAContact) {
+        waMap.set(c.id._serialized, (c.pushname || c.name || c.id.user || '').trim());
+      }
+    }
+  } catch (e) {
+    logger.error('WhatsApp', `getContacts failed during reconcile: ${e.message}`);
+    return { error: e.message };
+  }
+
+  const local = stmts.getAllContacts.all();
+  let renamed = 0, onWa = 0, offWa = 0, dropped = 0;
+  for (const c of local) {
+    const waName = waMap.get(c.phone_number);
+    if (waName !== undefined) {
+      onWa++;
+      stmts.setOnWhatsapp.run(1, c.phone_number);
+      if (waName) {
+        if (waName !== c.wa_name) renamed++;
+        // WhatsApp name wins (per host).
+        stmts.setWaName.run(waName, waName, waName, c.phone_number);
+      }
+    } else {
+      offWa++;
+      stmts.setOnWhatsapp.run(0, c.phone_number);
+      if (dropOnly) {
+        try { deleteContactCascade(c.phone_number); dropped++; }
+        catch (e) { logger.warn('WhatsApp', `Drop failed for ${c.phone_number}: ${e.message}`); }
+      }
+    }
+  }
+  return { onWa, offWa, renamed, dropped, total: local.length };
+}
+
 function checkRateLimit(userId) {
   const now = Date.now();
   const last = userRateLimit.get(userId) || 0;
@@ -357,22 +492,13 @@ async function callOllama(messages, retries = 2) {
   const payload = { model: MODEL_NAME, messages, stream: false };
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
-      console.log(`[Ollama] Attempt ${attempt + 1}/${retries + 1} — url=${OLLAMA_URL} model=${MODEL_NAME} msgs=${messages.length}`);
-      console.log(`[Ollama] Payload preview:`, JSON.stringify(messages.slice(0, 2)).slice(0, 300));
+      logger.debug('Ollama', `Attempt ${attempt + 1}/${retries + 1} — msgs=${messages.length}`);
       const res = await axiosInstance.post(OLLAMA_URL, payload);
       const content = res.data?.message?.content || '';
-      console.log(`[Ollama] ✅ Response OK — length=${content.length} chars`);
-      console.log(`[Ollama] Response preview:`, content.slice(0, 200));
+      logger.debug('Ollama', `Response OK — length=${content.length} chars`);
       return content || 'No response from AI.';
     } catch (err) {
-      console.error(`[Ollama] ❌ Attempt ${attempt + 1} FAILED`);
-      console.error(`[Ollama] err.message:`, err.message);
-      console.error(`[Ollama] err.code:`, err.code);
-      if (err.response) {
-        console.error(`[Ollama] HTTP ${err.response.status}:`, JSON.stringify(err.response.data).slice(0, 500));
-      } else {
-        console.error(`[Ollama] No response — network/connection error`);
-      }
+      logger.error('Ollama', `Attempt ${attempt + 1} FAILED`, { message: err.message, code: err.code, status: err.response?.status });
       if (attempt < retries) await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
     }
   }
@@ -392,7 +518,7 @@ async function evaluateConversation(chatId) {
       broadcast('eval', { chatId });
     }
   } catch (err) {
-    console.error('[Evaluator] Failed:', err.message);
+    logger.error('Evaluator', `Failed for ${chatId}`, { error: err.message });
   }
 }
 
@@ -413,7 +539,7 @@ async function extractTasks(chatId) {
       if (tasks.length) broadcast('task', { chatId });
     }
   } catch (err) {
-    console.error('[TaskExtractor] Failed:', err.message);
+    logger.error('TaskExtractor', `Failed for ${chatId}`, { error: err.message });
   }
 }
 
@@ -434,51 +560,43 @@ const client = new Client({
 client.on('qr', (qr) => {
   qrCode = qr;
   whatsappReady = false;
-  console.log('\n=== SCAN THIS QR CODE WITH YOUR WHATSAPP ===');
+  logger.info('WhatsApp', 'QR code received — scan with your phone');
   qrcode.generate(qr, { small: true });
   broadcast('status', { connected: false, qr: true });
 });
 
-client.on('authenticated', () => console.log('[WhatsApp] Authenticated'));
+client.on('authenticated', () => logger.info('WhatsApp', 'Authenticated'));
 
 client.on('auth_failure', (msg) => {
-  console.error('[WhatsApp] Auth failure:', msg);
+  logger.error('WhatsApp', `Auth failure: ${msg}`);
   broadcast('status', { connected: false, error: msg });
 });
 
 client.on('ready', async () => {
   whatsappReady = true;
   qrCode = null;
-  console.log('[WhatsApp] Kamila bot connected');
+  logger.info('WhatsApp', 'Kamila bot connected');
   try {
-    const contacts = await client.getContacts();
-    let synced = 0;
-    for (const c of contacts) {
-      if (c.isWAContact) {
-        const name = c.pushname || c.name || c.number || c.id.user || '';
-        stmts.upsertContact.run(c.id._serialized, name);
-        synced++;
-      }
-    }
-    console.log(`[WhatsApp] Synced ${synced} contacts`);
-    broadcast('contact', { synced });
+    const res = await reconcileContacts({ dropOnly: false });
+    logger.info('WhatsApp', `Reconciled contacts: ${res.onWa} on WhatsApp, ${res.offWa} not on WhatsApp (${res.renamed} renamed)`);
+    broadcast('contact', { synced: res.onWa, offWa: res.offWa });
   } catch (e) {
-    console.error('[WhatsApp] Contact sync failed:', e.message);
+    logger.error('WhatsApp', `Contact sync failed: ${e.message}`);
   }
   broadcast('status', { connected: true });
 });
 
-client.on('loading_screen', (percent, message) => console.log(`[WhatsApp] Loading: ${percent}% - ${message}`));
+client.on('loading_screen', (percent, message) => logger.debug('WhatsApp', `Loading: ${percent}% - ${message}`));
 
 client.on('disconnected', (reason) => {
   whatsappReady = false;
-  console.error('[WhatsApp] Disconnected:', reason);
+  logger.error('WhatsApp', `Disconnected: ${reason}`);
   broadcast('status', { connected: false, reason });
-  console.log('[WhatsApp] Reconnecting in 5s...');
+  logger.info('WhatsApp', 'Reconnecting in 5s...');
   setTimeout(() => client.initialize(), 5000);
 });
 
-client.on('change_state', (state) => console.log('[WhatsApp] State:', state));
+client.on('change_state', (state) => logger.debug('WhatsApp', `State: ${state}`));
 
 client.on('message', async (msg) => {
   try {
@@ -489,8 +607,9 @@ client.on('message', async (msg) => {
     const body = sanitizeInput(msg.body);
     if (!body) return;
 
-    // Log all messages (including groups) for context
-    stmts.upsertContact.run(msg.from, msg._data?.pushname || msg._data?.notifyName || msg.from);
+    // Log all messages (including groups) for context.
+    // New incoming numbers are auto-registered as AUTO (per host: any new chat = AUTO until toggled).
+    stmts.upsertContactFromChat.run(msg.from, msg._data?.pushname || msg._data?.notifyName || msg.from);
     const contact = stmts.getContact.get(msg.from);
     const mode = contact?.auto_reply_mode || 'AUTO';
 
@@ -500,23 +619,67 @@ client.on('message', async (msg) => {
     // Groups: read-only, no reply, no AI
     if (isGroup) return;
 
-    // Access control: silently ignore blocked / not-allowed numbers (still logged)
-    if (!accessAllowed(msg.from)) return;
+    // Registration prompt: non-blocking. Marks a PENDING registration for the dashboard.
+    // The chat still gets normal AUTO replies (registration never blocks conversation).
+    try {
+      if (contact && contact.registered === 0 && !isGroup) {
+        const lastReg = stmts.getRegistration.get(chatId);
+        if (!lastReg || lastReg.status !== 'PENDING') {
+          const prompt = detectSwahili(body)
+            ? 'Habari! Mimi ni Kamila, msaidizi wa Francis. Tafadhali niambie jina lako ili nikusajili.'
+            : "Hi! I'm Kamila, Francis's assistant. Please tell me your name so I can register you.";
+          stmts.insertMessage.run(chatId, 'kamila', prompt, 1);
+          broadcast('message', { chatId });
+          await msg.reply(prompt);
+          stmts.insertRegistration.run(chatId, contact.name || '');
+          logger.info('Bot', `Registration prompt sent to ${chatId}`);
+        } else if (/^[a-zA-Z\u00C0-\u024F][a-zA-Z\u00C0-\u024F .'-]{1,40}$/.test(body.trim())) {
+          // User replied with what looks like a name (pending) — record it as the submitted name.
+          stmts.insertRegistration.run(chatId, body.trim());
+        }
+        // fall through: still run normal AUTO conversation (non-blocking)
+      }
+    } catch (regErr) {
+      logger.warn('Bot', `Registration flow error for ${chatId}: ${regErr.message}`);
+    }
 
     if (!checkRateLimit(msg.from)) return;
     if (mode === 'OFF') return;
+
+    // Stop-until-resolved gate: if this chat is flagged needs-human-help, do NOT run AI.
+    // Stay paused (silent after the first handoff) until Francis resolves the flag.
+    const evalRow = stmts.getEvaluation.get(chatId);
+    if (evalRow?.needs_human_help === 1) {
+      const lastSent = pausedHandoffSent.get(chatId) || 0;
+      if (Date.now() - lastSent >= HANDOFF_RESEND_MS) {
+        const handoff = detectSwahili(body) ? HANDOFF_SW : HANDOFF_EN;
+        pausedHandoffSent.set(chatId, Date.now());
+        stmts.insertMessage.run(chatId, 'kamila', handoff, 1);
+        broadcast('message', { chatId });
+        try { await msg.reply(handoff); } catch (e) { logger.warn('Bot', `Handoff send failed: ${e.message}`); }
+      }
+      logger.info('Bot', `Chat ${chatId} is flagged needs-human-help — AI paused`);
+      return;
+    }
 
     try {
       const chat = await msg.getChat();
       await chat.sendStateTyping();
     } catch (typingErr) {
-      console.error('[Bot] Typing indicator failed (WhatsApp may still be loading):', typingErr.message);
+      logger.warn('Bot', `Typing indicator failed: ${typingErr.message}`);
     }
 
     const history = stmts.getMessages.all(chatId).reverse().slice(-10);
     // Persona comes from the model's built-in SYSTEM (Modelfile), not injected here.
     const ollamaMessages = history.map((m) => ({ role: m.is_ai ? 'assistant' : 'user', content: m.text }));
-    const aiReply = await callOllama(ollamaMessages);
+
+    // Inject memory context if available
+    const memoryCtx = buildMemoryContext(chatId, memStmts);
+    if (memoryCtx) ollamaMessages.unshift(memoryCtx);
+
+    const aiReplyRaw = await callOllama(ollamaMessages);
+    // Format for WhatsApp: convert markdown to WhatsApp-native formatting, hard-cap to 10 words
+    const aiReply = enforceWordCap(formatForWhatsApp(aiReplyRaw));
 
     if (mode === 'DRAFT') {
       const draftRow = stmts.insertDraft.run(chatId, msg.from, aiReply);
@@ -535,24 +698,9 @@ client.on('message', async (msg) => {
     const chunks = splitMessage(aiReply);
     for (const chunk of chunks) await msg.reply(chunk);
 
-    setTimeout(() => { evaluateConversation(chatId); extractTasks(chatId); }, 5000);
+    setTimeout(() => { evaluateConversation(chatId); extractTasks(chatId); maybeUpdateMemory(chatId, memStmts, callOllama, db); }, 5000);
   } catch (err) {
-    console.error('[Bot] ═══════════════════════════════════════');
-    console.error('[Bot] FULL ERROR:', JSON.stringify(err, Object.getOwnPropertyNames(err), 2));
-    console.error('[Bot] err.message:', err.message);
-    console.error('[Bot] err.code:', err.code);
-    console.error('[Bot] err.name:', err.name);
-    console.error('[Bot] err.stack:', err.stack);
-    if (err.response) {
-      console.error('[Bot] err.response.status:', err.response.status);
-      console.error('[Bot] err.response.data:', JSON.stringify(err.response.data).slice(0, 500));
-    }
-    if (err.config) {
-      console.error('[Bot] err.config.url:', err.config.url);
-      console.error('[Bot] err.config.method:', err.config.method);
-      console.error('[Bot] err.config.data:', err.config.data ? JSON.stringify(err.config.data).slice(0, 500) : 'none');
-    }
-    console.error('[Bot] ═══════════════════════════════════════');
+    logger.error('Bot', `Error handling message from ${chatId}`, { message: err.message, code: err.code, stack: err.stack?.split('\n').slice(0, 3).join(' | ') });
     try { await msg.reply('⚠️ *Kamila Error*: AI server unreachable. Is Ollama running?'); } catch {}
   }
 });
@@ -631,50 +779,49 @@ app.post('/api/contacts/:id/mode', (req, res) => {
   res.json({ ok: true, mode });
 });
 
-// ── Access control (whitelist / blacklist) ──
-
-app.get('/api/access', (_req, res) => {
-  res.json({
-    whitelist: stmts.getWhitelist.all().map(r => r.phone_number),
-    blacklist: stmts.getBlacklist.all().map(r => r.phone_number),
-    allowlistActive: stmts.getWhitelistCount.get().n > 0,
-  });
-});
-
-app.get('/api/access/status/:phone', (req, res) => {
-  const phone = canonicalPhone(req.params.phone);
-  if (!phone) return res.status(400).json({ error: 'Invalid phone number' });
-  res.json({ phone, allowed: accessAllowed(phone) });
-});
-
-app.post('/api/access', (req, res) => {
-  const { phone, list_type } = req.body || {};
-  const normalized = canonicalPhone(phone);
-  if (!normalized) return res.status(400).json({ error: 'Invalid phone number' });
-  if (!['WHITELIST', 'BLACKLIST'].includes(list_type))
-    return res.status(400).json({ error: 'list_type must be WHITELIST or BLACKLIST' });
-  stmts.addAccess.run(normalized, list_type);
-  broadcast('access', { phone: normalized, list_type });
-  res.json({ ok: true, phone: normalized, list_type });
-});
-
-app.post('/api/access/remove', (req, res) => {
-  const { phone } = req.body || {};
-  const normalized = canonicalPhone(phone);
-  if (!normalized) return res.status(400).json({ error: 'Invalid phone number' });
-  stmts.removeAccess.run(normalized);
-  broadcast('access', { phone: normalized, removed: true });
-  res.json({ ok: true, phone: normalized });
-});
-
-app.post('/api/access/clear', (req, res) => {
-  const { list_type } = req.body || {};
-  if (!['WHITELIST', 'BLACKLIST'].includes(list_type))
-    return res.status(400).json({ error: 'list_type must be WHITELIST or BLACKLIST' });
-  const info = stmts.clearAccess.run(list_type);
-  broadcast('access', { list_type, cleared: true });
-  res.json({ ok: true, list_type, cleared: info.changes });
-});
+// ── Access control (whitelist / blacklist) — DISABLED, kept for recovery. ──
+// app.get('/api/access', (_req, res) => {
+//   res.json({
+//     whitelist: stmts.getWhitelist.all().map(r => r.phone_number),
+//     blacklist: stmts.getBlacklist.all().map(r => r.phone_number),
+//     allowlistActive: stmts.getWhitelistCount.get().n > 0,
+//   });
+// });
+//
+// app.get('/api/access/status/:phone', (req, res) => {
+//   const phone = canonicalPhone(req.params.phone);
+//   if (!phone) return res.status(400).json({ error: 'Invalid phone number' });
+//   res.json({ phone, allowed: accessAllowed(phone) });
+// });
+//
+// app.post('/api/access', (req, res) => {
+//   const { phone, list_type } = req.body || {};
+//   const normalized = canonicalPhone(phone);
+//   if (!normalized) return res.status(400).json({ error: 'Invalid phone number' });
+//   if (!['WHITELIST', 'BLACKLIST'].includes(list_type))
+//     return res.status(400).json({ error: 'list_type must be WHITELIST or BLACKLIST' });
+//   stmts.addAccess.run(normalized, list_type);
+//   broadcast('access', { phone: normalized, list_type });
+//   res.json({ ok: true, phone: normalized, list_type });
+// });
+//
+// app.post('/api/access/remove', (req, res) => {
+//   const { phone } = req.body || {};
+//   const normalized = canonicalPhone(phone);
+//   if (!normalized) return res.status(400).json({ error: 'Invalid phone number' });
+//   stmts.removeAccess.run(normalized);
+//   broadcast('access', { phone: normalized, removed: true });
+//   res.json({ ok: true, phone: normalized });
+// });
+//
+// app.post('/api/access/clear', (req, res) => {
+//   const { list_type } = req.body || {};
+//   if (!['WHITELIST', 'BLACKLIST'].includes(list_type))
+//     return res.status(400).json({ error: 'list_type must be WHITELIST or BLACKLIST' });
+//   const info = stmts.clearAccess.run(list_type);
+//   broadcast('access', { list_type, cleared: true });
+//   res.json({ ok: true, list_type, cleared: info.changes });
+// });
 
 app.post('/api/contacts/import', (req, res) => {
   let { contacts, vcard } = req.body;
@@ -719,27 +866,46 @@ app.post('/api/contacts/import', (req, res) => {
 
 app.post('/api/contacts/sync', async (req, res) => {
   if (!client.info) return res.status(503).json({ error: 'WhatsApp client not ready' });
-  const allContacts = stmts.getAllContacts.all();
-  const BATCH = 50;
-  const matched = [];
-  const unmatched = [];
-  for (let i = 0; i < allContacts.length; i += BATCH) {
-    const batch = allContacts.slice(i, i + BATCH);
-    const checks = await Promise.allSettled(
-      batch.map(async (c) => {
-        try {
-          const wa = await client.getContactById(c.phone_number);
-          return { ...c, isOnWhatsApp: !!wa };
-        } catch { return { ...c, isOnWhatsApp: false }; }
-      })
-    );
-    for (const r of checks) {
-      const val = r.status === 'fulfilled' ? r.value : { ...batch[checks.indexOf(r)], isOnWhatsApp: false };
-      if (val.isOnWhatsApp) matched.push(val); else unmatched.push(val);
-    }
-  }
-  broadcast('contact', { synced: true, matched: matched.length, unmatched: unmatched.length });
-  res.json({ ok: true, matched: matched.length, unmatched: unmatched.length, total: allContacts.length });
+  const res2 = await reconcileContacts({ dropOnly: true });
+  if (res2.error) return res.status(500).json({ error: res2.error });
+  broadcast('contact', { synced: true, matched: res2.onWa, dropped: res2.dropped, renamed: res2.renamed });
+  res.json({ ok: true, matched: res2.onWa, dropped: res2.dropped, renamed: res2.renamed, offWa: res2.offWa, total: res2.total });
+});
+
+// Registrations (new-number onboarding)
+app.get('/api/registrations', (_req, res) => {
+  const pending = stmts.getPendingRegistrations.all().map((r) => {
+    const contact = stmts.getContact.get(r.chat_id);
+    return { ...r, wa_name: contact?.wa_name || contact?.name || '', phone: r.chat_id };
+  });
+  res.json(pending);
+});
+
+app.post('/api/registrations/:chatId/approve', (req, res) => {
+  const { chatId } = req.params;
+  if (!chatId || typeof chatId !== 'string') return res.status(400).json({ error: 'chatId required' });
+  stmts.approveRegistration.run(chatId);
+  stmts.registerContact.run(chatId);
+  broadcast('contact', { chatId, registered: true });
+  res.json({ ok: true });
+});
+
+app.post('/api/registrations/:chatId/reject', (req, res) => {
+  const { chatId } = req.params;
+  if (!chatId || typeof chatId !== 'string') return res.status(400).json({ error: 'chatId required' });
+  stmts.rejectRegistration.run(chatId);
+  deleteContactCascade(chatId);
+  broadcast('contact', { chatId, rejected: true });
+  res.json({ ok: true });
+});
+
+// Manual drop of a contact (cascade delete) — for dashboard cleanup.
+app.post('/api/contacts/drop', (req, res) => {
+  const { chatId } = req.body || {};
+  if (!chatId || typeof chatId !== 'string') return res.status(400).json({ error: 'chatId required' });
+  deleteContactCascade(chatId);
+  broadcast('contact', { chatId, dropped: true });
+  res.json({ ok: true });
 });
 
 app.post('/api/send', async (req, res) => {
@@ -750,8 +916,9 @@ app.post('/api/send', async (req, res) => {
     return res.status(400).json({ error: 'Invalid chatId format (expected number@c.us etc.)' });
   if (text.length > 10000)
     return res.status(400).json({ error: 'Message too long (max 10000 chars)' });
-  if (!accessAllowed(chatId))
-    return res.status(403).json({ error: 'This contact is blocked by access control' });
+  // Access control disabled — manual send allowed to any number.
+  // if (!accessAllowed(chatId))
+  //   return res.status(403).json({ error: 'This contact is blocked by access control' });
   try {
     for (const chunk of splitMessage(text)) await client.sendMessage(chatId, chunk);
     stmts.insertMessage.run(chatId, 'kamila', text, 1);
@@ -772,8 +939,9 @@ app.post('/api/send-draft', async (req, res) => {
     draft = stmts.getDraftsByChat.get(chatId);
   }
   if (!draft) return res.status(404).json({ error: 'No draft found' });
-  if (!accessAllowed(draft.chat_id))
-    return res.status(403).json({ error: 'This contact is blocked by access control' });
+  // Access control disabled — draft send allowed to any number.
+  // if (!accessAllowed(draft.chat_id))
+  //   return res.status(403).json({ error: 'This contact is blocked by access control' });
   try {
     for (const chunk of splitMessage(draft.text)) await client.sendMessage(draft.to_number, chunk);
     stmts.insertMessage.run(draft.chat_id, 'kamila', draft.text, 1);
@@ -812,6 +980,41 @@ app.post('/api/evaluate', async (req, res) => {
   res.json({ ok: true });
 });
 
+// Francis clears the flag on a chat — AI resumes normal replies
+app.post('/api/evaluate/resolve', async (req, res) => {
+  const { chatId } = req.body;
+  if (!chatId || typeof chatId !== 'string')
+    return res.status(400).json({ error: 'chatId required (string)' });
+  stmts.resolveEvaluation.run(chatId);
+  pausedHandoffSent.delete(chatId);
+  broadcast('eval', { chatId });
+  logger.info('Bot', `Chat ${chatId} resolved by Francis — AI resumed`);
+  res.json({ ok: true });
+});
+
+// ── Broadcast ──
+
+// ── Feedback API ──
+
+app.get('/api/feedback', (_req, res) => res.json(stmts.getAllFeedback.all()));
+
+app.get('/api/feedback/stats', (_req, res) => res.json(stmts.getFeedbackStats.all()));
+
+app.get('/api/feedback/:chatId', (req, res) => res.json(stmts.getFeedbackByChat.all(req.params.chatId)));
+
+app.post('/api/feedback', (req, res) => {
+  const { chatId, messageTs, rating, comment } = req.body;
+  if (!chatId || typeof chatId !== 'string') return res.status(400).json({ error: 'chatId required' });
+  if (![1, -1].includes(rating)) return res.status(400).json({ error: 'rating must be 1 or -1' });
+  stmts.insertFeedback.run(chatId, messageTs || null, rating, comment || null);
+  broadcast('feedback', { chatId, rating });
+  res.json({ ok: true });
+});
+
+// ── Memory API ──
+
+app.get('/api/memory', (_req, res) => res.json(getMemoryStats(memStmts)));
+
 // ── Broadcast ──
 
 app.post('/api/broadcast', async (req, res) => {
@@ -832,7 +1035,8 @@ app.post('/api/broadcast', async (req, res) => {
   for (let i = 0; i < contacts.length; i++) {
     const phone = contacts[i];
     const chatId = phone.includes('@') ? phone : phone.replace(/[^0-9]/g, '') + '@c.us';
-    if (!accessAllowed(chatId)) { skipped++; continue; }
+    // Access control disabled — broadcast to any number.
+    // if (!accessAllowed(chatId)) { skipped++; continue; }
     try {
       for (const chunk of splitMessage(text)) await client.sendMessage(chatId, chunk);
       stmts.insertMessage.run(chatId, 'kamila', text, 1);
@@ -885,7 +1089,7 @@ app.post('/api/enhance', async (req, res) => {
 // ── Graceful Shutdown ──
 
 async function shutdown() {
-  console.log('\n[Shutdown] Cleaning up...');
+  logger.info('Shutdown', 'Cleaning up...');
   try { await client.destroy(); } catch {}
   try { db.close(); } catch {}
   httpServer.close(() => process.exit(0));
