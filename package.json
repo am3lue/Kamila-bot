@@ -1,28 +1,33 @@
 {
-  "name": "kamila-tsaap-bot",
-  "version": "1.0.0",
-  "description": "WhatsApp bot with Ollama AI and web dashboard",
+  "name": "kamila",
+  "version": "2.0.0",
+  "description": "WhatsApp projects as an API: OTP codes or an AI chatbot (Gemini), with a dashboard, website widget and webhooks",
   "main": "server.js",
   "type": "module",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js"
+    "dev": "node --watch server.js",
+    "check": "node --check server.js && for f in gateway/*.js bot/*.js utils/*.js public/*.js; do node --check \"$f\" || exit 1; done"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.119.0",
+    "@tausi-auth/js": "0.3.1",
+    "@tausi-auth/node": "0.3.1",
     "axios": "^1.7.2",
     "better-sqlite3": "^13.0.3",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
-    "qrcode-terminal": "^0.12.0",
+    "qrcode": "^1.5.4",
     "whatsapp-web.js": "^1.34.7"
   },
   "overrides": {
     "qs": "^6.16.0"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.0.0"
   },
   "allowScripts": {
     "better-sqlite3@13.0.3": true
-  }
+  },
+  "private": true
 }

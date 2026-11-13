@@ -1,4 +1,4 @@
-import logger from './logger.js';
+import logger from '../utils/logger.js';
 
 const MOD = 'Memory';
 const SUMMARY_INTERVAL = 10;
@@ -41,12 +41,12 @@ export function buildMemoryContext(chatId, stmts) {
   };
 }
 
-export async function updateMemory(chatId, stmts, callOllama, db) {
+export async function updateMemory(chatId, stmts, callAI, db) {
   try {
     const messages = db.prepare(`SELECT * FROM messages WHERE chat_id = ? ORDER BY timestamp DESC LIMIT 30`).all(chatId);
     if (messages.length < 3) return;
     const transcript = messages.map((m) => `${m.sender}: ${m.text}`).join('\n').slice(-2000);
-    const raw = await callOllama([{
+    const raw = await callAI([{
       role: 'user',
       content: `Summarize this conversation in 2-3 short sentences. Include: what they discussed, any decisions made, any pending topics. Return ONLY the summary text, no labels.\n\nConversation:\n${transcript}`,
     }], 1);
@@ -60,17 +60,13 @@ export async function updateMemory(chatId, stmts, callOllama, db) {
   }
 }
 
-export function maybeUpdateMemory(chatId, stmts, callOllama, db) {
+export function maybeUpdateMemory(chatId, stmts, callAI, db) {
   const row = stmts.getConversation.get(chatId);
   const lastCount = row?.last_msg_count || 0;
   const current = db.prepare(`SELECT COUNT(*) AS n FROM messages WHERE chat_id = ?`).get(chatId)?.n || 0;
   if (current - lastCount >= SUMMARY_INTERVAL) {
-    updateMemory(chatId, stmts, callOllama, db);
+    updateMemory(chatId, stmts, callAI, db);
     return true;
   }
   return false;
-}
-
-export function getMemoryStats(stmts) {
-  return stmts.getAllConversations.all();
 }

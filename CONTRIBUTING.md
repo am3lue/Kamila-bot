@@ -16,8 +16,8 @@ Thanks for your interest in contributing! This document provides guidelines for 
 
 ```bash
 # Clone your fork
-git clone https://github.com/your-username/Kamila-Tsaap-Bot.git
-cd Kamila-Tsaap-Bot
+git clone https://github.com/<you>/Kamila-bot.git
+cd Kamila-bot
 
 # Install dependencies
 npm install

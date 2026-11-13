@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)">
+  <meta name="theme-color" content="#fafafa" media="(prefers-color-scheme: light)">
+  <title>Sign in · Kamila</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500;600&display=swap">
+  <link rel="stylesheet" href="/dashboard.css">
+</head>
+<body class="login-body">
+  <main class="login-wrap">
+    <div class="card login-card">
+      <h1 class="logo login-logo">Kamila</h1>
+      <p class="login-tag">WhatsApp API for your business</p>
+      <p class="login-copy">Link your WhatsApp number once, then use it from your own apps and website.</p>
+      <ul class="login-features">
+        <li><span class="login-ico" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg></span><span><strong>OTP codes</strong>Send and verify sign-in codes</span></li>
+        <li><span class="login-ico" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4z"/></svg></span><span><strong>Messages</strong>Order updates, reminders and alerts</span></li>
+        <li><span class="login-ico" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></span><span><strong>AI chatbot</strong>Answers customers on WhatsApp and your site</span></li>
+      </ul>
+      <div class="login-actions">
+        <button class="btn btn-primary login-btn" id="btn-signin" disabled aria-busy="true"><span class="login-spin" aria-hidden="true"></span><span class="login-label">Sign in</span></button>
+        <button class="btn login-btn" id="btn-signup" disabled><span class="login-label">Create an account</span></button>
+      </div>
+      <p class="login-msg" id="login-msg" role="status" aria-live="polite"></p>
+      <p class="login-foot"><svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg> Secured by Tausi Auth</p>
+    </div>
+  </main>
+  <script type="module">
+    import { getTausi, safeNext } from '/auth-client.js';
+
+    const msg = document.getElementById('login-msg');
+    const params = new URLSearchParams(location.search);
+    const next = safeNext(params.get('next') || sessionStorage.getItem('kamila_next') || '/dashboard.html');
+
+    function show(text, isError) {
+      msg.textContent = text;
+      msg.classList.toggle('login-error', !!isError);
+    }
+
+    try {
+      const tausi = await getTausi();
+
+      // Returning from the hosted Tausi page (?tausi_code=… or ?tausi_error=…)
+      try {
+        const result = await tausi.handleOAuthCallback();
+        if (result) {
+          sessionStorage.removeItem('kamila_next');
+          location.replace(next);
+        }
+      } catch (err) {
+        show(err.message || 'Sign-in failed', true);
+      }
+
+      await tausi.initialize();
+      if (tausi.getState().status === 'signedIn') {
+        location.replace(next);
+      } else {
+        const signin = document.getElementById('btn-signin');
+        const signup = document.getElementById('btn-signup');
+        const setBusy = (btn, on) => {
+          signin.disabled = signup.disabled = on;
+          btn.setAttribute('aria-busy', String(on));
+          if (!btn.querySelector('.login-spin')) btn.insertAdjacentHTML('afterbegin', '<span class="login-spin" aria-hidden="true"></span>');
+        };
+        const go = (btn, mode) => async () => {
+          sessionStorage.setItem('kamila_next', next);
+          setBusy(btn, true);
+          show('Taking you to the secure sign-in page…');
+          try {
+            await tausi.redirectToHostedPage({ redirectTo: location.origin + '/login.html', mode });
+          } catch (err) {
+            setBusy(btn, false);
+            show(err.message || 'Could not start sign-in', true);
+          }
+        };
+        signin.onclick = go(signin, 'sign-in');
+        signup.onclick = go(signup, 'sign-up');
+        signin.setAttribute('aria-busy', 'false');
+        signin.disabled = signup.disabled = false;
+        signin.focus();
+      }
+    } catch (err) {
+      document.getElementById('btn-signin').setAttribute('aria-busy', 'false');
+      show('Sign-in service unavailable: ' + err.message, true);
+    }
+  </script>
+</body>
+</html>

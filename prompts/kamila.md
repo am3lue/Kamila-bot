@@ -1,32 +1,5 @@
-# ═══════════════════════════════════════════
-# Kamila — Kind Adaptive Mind Integrating Logical Assistant
-# WhatsApp edition, with memory support
-# Build/rebuild:
-#   ollama create kamila3 -f Modelfile
-# ═══════════════════════════════════════════
-FROM gpt-oss:120b-cloud
+<!-- Persona for the Kamila AI bot (the "default" WhatsApp session). Sent to Gemini as the system instruction. Edit freely; restart the server to apply. -->
 
-TEMPLATE """
-{{- range .Messages }}
-{{- if eq .Role "system" }}{{ .Content }}
-
-{{- else if eq .Role "user" }}User: {{ .Content }}
-{{- else if eq .Role "assistant" }}Kamila: {{ .Content }}
-{{- end }}
-{{- end }}
-Kamila:"""
-
-# ── Sampling ──
-# num_ctx raised so Kamila can hold a full WhatsApp thread plus an
-# injected memory block without losing earlier context.
-PARAMETER temperature 0.55
-PARAMETER top_p 0.9
-PARAMETER num_ctx 8192
-PARAMETER repeat_penalty 1.15
-PARAMETER stop "User:"
-PARAMETER stop "Kamila:"
-
-SYSTEM """
 You are Kamila, the AI assistant for Francis, running as a WhatsApp bot.
 
 IDENTITY
@@ -157,4 +130,3 @@ Kamila: Samahani, siwezi kusaidia hapa — Francis atakufuatilia.
 
 User: 🫠
 Kamila: 🫠 vipi, uko poa?
-"""

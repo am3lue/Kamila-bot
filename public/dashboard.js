@@ -16,25 +16,24 @@
     out = out.replace(/\n/g, '<br>');
     return out;
   }
-  const apiKey = () => localStorage.getItem('kamila_api_key') || '';
-  let shown401Toast = false;
+  // Every call carries the Tausi session token (see auth-boot.js).
+  const Auth = window.KamilaAuth;
   function apiErr(r, msg) {
     const e = new Error(msg || 'API error');
     e.status = r.status;
     return e;
   }
-  const api = (u) => fetch(u, { headers: { 'x-api-key': apiKey() } }).then(r => {
-    if (!r.ok) {
-      if (r.status === 401 && !shown401Toast) { shown401Toast = true; toast('API key required — go to Settings to enter it', 'error'); }
-      throw apiErr(r, `GET ${u} failed (${r.status})`);
-    }
+  async function authedFetch(u, opts = {}) {
+    const r = await fetch(u, { ...opts, headers: await Auth.headers(opts.headers) });
+    if (r.status === 401) Auth.expired();
+    return r;
+  }
+  const api = (u) => authedFetch(u).then(r => {
+    if (!r.ok) throw apiErr(r, `GET ${u} failed (${r.status})`);
     return r.json();
   });
-  const post = (u, b) => fetch(u, { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey() }, body: JSON.stringify(b) }).then(r => {
-    if (!r.ok) {
-      if (r.status === 401 && !shown401Toast) { shown401Toast = true; toast('API key required — go to Settings to enter it', 'error'); }
-      throw apiErr(r, `POST ${u} failed (${r.status})`);
-    }
+  const post = (u, b) => authedFetch(u, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(b) }).then(r => {
+    if (!r.ok) throw apiErr(r, `POST ${u} failed (${r.status})`);
     return r.json();
   });
 
@@ -56,7 +55,6 @@
 
   // ── SSE with auto-reconnect and polling fallback ──
   let evtSource = null;
-  let sseConnected = false;
   let pollInterval = null;
   const sseListeners = {};
 
@@ -65,21 +63,27 @@
     sseListeners[event].push(fn);
   }
 
-  function connectSSE() {
+  async function connectSSE() {
     if (evtSource) evtSource.close();
     if (pollInterval) { clearInterval(pollInterval); pollInterval = null; }
-    evtSource = new EventSource('/api/events');
-    evtSource.onopen = () => {
-      sseConnected = true;
-      console.log('[SSE] Connected');
-    };
+    let ticket;
+    try {
+      const r = await authedFetch('/auth/sse-ticket', { method: 'POST' });
+      if (!r.ok) throw new Error('ticket ' + r.status);
+      ({ ticket } = await r.json());
+    } catch {
+      setTimeout(connectSSE, 5000);
+      startPollingFallback();
+      return;
+    }
+    evtSource = new EventSource('/api/events?ticket=' + encodeURIComponent(ticket));
     evtSource.onmessage = (e) => {
       try {
         const data = JSON.parse(e.data);
         (sseListeners['message'] || []).forEach(fn => fn(data));
       } catch {}
     };
-    for (const ev of ['message', 'draft', 'task', 'eval', 'contact', 'status', 'broadcast', 'enhance']) {
+    for (const ev of ['message', 'draft', 'task', 'eval', 'contact', 'status', 'session', 'otp', 'chat']) {
       evtSource.addEventListener(ev, (e) => {
         try {
           const data = JSON.parse(e.data);
@@ -88,8 +92,6 @@
       });
     }
     evtSource.onerror = () => {
-      sseConnected = false;
-      console.warn('[SSE] Disconnected, reconnecting in 3s...');
       evtSource.close();
       setTimeout(connectSSE, 3000);
       startPollingFallback();
@@ -98,7 +100,7 @@
 
   function startPollingFallback() {
     if (pollInterval) return;
-    console.log('[Poll] Starting fallback polling (5s)');
+    if (!Auth.isOwner) return;
     pollInterval = setInterval(async () => {
       try {
         const s = await api('/api/status');
@@ -115,18 +117,32 @@
   const routes = {};
   let currentView = null;
 
+  // route('#/x', fn) matches exactly; route('#/x/*', fn) matches '#/x/<rest>' and calls fn(rest).
+  const prefixRoutes = [];
   function route(hash, handler) {
-    routes[hash] = handler;
+    if (hash.endsWith('/*')) prefixRoutes.push([hash.slice(0, -1), handler]);
+    else routes[hash] = handler;
   }
 
+  const OWNER_VIEWS = new Set(['#/overview', '#/chats', '#/tasks', '#/settings']);
   function navigate() {
-    const hash = location.hash || '#/overview';
-    const handler = routes[hash];
-    if (!handler) { location.hash = '#/overview'; return; }
-    $$('.nav-item').forEach(n => n.classList.toggle('active', n.getAttribute('href') === hash));
+    const home = '#/projects';
+    const hash = location.hash || home;
+    let handler = routes[hash];
+    if (!handler) {
+      const m = prefixRoutes.find(([p]) => hash.startsWith(p) && hash.length > p.length);
+      if (m) handler = () => m[1](decodeURIComponent(hash.slice(m[0].length)));
+    }
+    if (!handler || (OWNER_VIEWS.has(hash) && !Auth.isOwner)) {
+      if (location.hash === home) return;
+      location.hash = home;
+      return;
+    }
+    $$('.nav-item').forEach((n) => { const h = n.getAttribute('href'); n.classList.toggle('active', h === hash || hash.startsWith(h + '/')); });
     currentView = hash.replace('#/', '');
     // Chats view is full-bleed: no page scroll, only the two panels scroll internally
     $('#main-content').classList.toggle('chat-view-active', currentView === 'chats');
+    if (window.KamilaDash?.onLeave) { window.KamilaDash.onLeave(); window.KamilaDash.onLeave = null; }
     // Stop chat poll when leaving chats view
     if (currentView !== 'chats' && chatPollTimer) { clearInterval(chatPollTimer); chatPollTimer = null; }
     handler();
@@ -140,7 +156,7 @@
       const s = await api('/api/status');
       const el = $('#conn-status');
       el.className = 'conn-badge ' + (s.connected ? 'conn-on' : s.hasQr ? 'conn-qr' : 'conn-off');
-      $('.conn-text', el).textContent = s.connected ? 'Connected' : s.hasQr ? 'Scan QR' : 'Disconnected';
+      $('.conn-text', el).textContent = s.connected ? 'Online' : s.hasQr ? 'Scan QR' : 'Offline';
     } catch {}
   }
 
@@ -158,6 +174,22 @@
   // ══════════════════════════════════
 
   let charts = {};
+  // Chart colours come from the CSS theme tokens so they follow light/dark mode.
+  const tok = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  function chartTheme() {
+    if (window.Chart) {
+      Chart.defaults.font.family = tok('--font') || 'system-ui';
+      Chart.defaults.font.size = 12;
+      Chart.defaults.color = tok('--text-muted');
+      Chart.defaults.borderColor = tok('--border');
+      Chart.defaults.plugins.legend.labels.usePointStyle = true;
+      Chart.defaults.plugins.legend.labels.boxWidth = 8;
+      Chart.defaults.plugins.legend.labels.boxHeight = 8;
+      Chart.defaults.elements.arc.borderColor = tok('--bg-card');
+      Chart.defaults.elements.arc.borderWidth = 2;
+    }
+    return { text: tok('--text'), dim: tok('--text-dim'), muted: tok('--text-muted'), border: tok('--border'), green: tok('--green'), red: tok('--red'), yellow: tok('--yellow'), card: tok('--bg-card') };
+  }
 
   async function renderOverview() {
     const mount = $('#view-mount');
@@ -196,41 +228,42 @@
     if (data.totals.needsHelp > 0) helpEl.classList.add('red'); else helpEl.classList.remove('red');
 
     // Volume chart
+    const T = chartTheme();
     if (charts.volume) charts.volume.destroy();
     const volLabels = data.volume.map(v => v.day.slice(5));
     charts.volume = new Chart($('#chart-volume'), {
       type: 'bar', data: {
         labels: volLabels,
         datasets: [
-          { label: 'Total', data: data.volume.map(v => v.messages), backgroundColor: 'rgba(139,92,246,.4)', borderColor: '#8b5cf6', borderWidth: 1 },
-          { label: 'AI', data: data.volume.map(v => v.ai), backgroundColor: 'rgba(34,197,94,.4)', borderColor: '#22c55e', borderWidth: 1 },
+          { label: 'Total', data: data.volume.map(v => v.messages), backgroundColor: T.text, borderRadius: 4, maxBarThickness: 18 },
+          { label: 'AI', data: data.volume.map(v => v.ai), backgroundColor: T.muted, borderRadius: 4, maxBarThickness: 18 },
         ]
-      }, options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { labels: { color: '#94a3b8' } } }, scales: { x: { ticks: { color: '#64748b' }, grid: { color: '#1e293b' } }, y: { ticks: { color: '#64748b' }, grid: { color: '#1e293b' } } } }
+      }, options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { align: 'end' } }, scales: { x: { grid: { display: false }, border: { display: false } }, y: { beginAtZero: true, grid: { color: T.border }, border: { display: false }, ticks: { precision: 0 } } } }
     });
 
     // Sentiment chart
     if (charts.sentiment) charts.sentiment.destroy();
     const sentLabels = Object.keys(data.sentimentMix);
-    const sentColors = sentLabels.map(s => s === 'positive' ? '#22c55e' : s === 'negative' ? '#ef4444' : '#eab308');
+    const sentColors = sentLabels.map(s => s === 'positive' ? T.green : s === 'negative' ? T.red : T.yellow);
     charts.sentiment = new Chart($('#chart-sentiment'), {
       type: 'doughnut', data: { labels: sentLabels, datasets: [{ data: Object.values(data.sentimentMix), backgroundColor: sentColors }] },
-      options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { labels: { color: '#94a3b8' } } } }
+      options: { responsive: true, maintainAspectRatio: false, cutout: '72%', plugins: { legend: { position: 'right' } } }
     });
 
     // Mode chart
     if (charts.mode) charts.mode.destroy();
     const modeLabels = Object.keys(data.modeMix);
-    const modeColors = modeLabels.map(m => m === 'AUTO' ? '#22c55e' : m === 'DRAFT' ? '#eab308' : '#ef4444');
+    const modeColors = modeLabels.map(m => m === 'AUTO' ? T.green : m === 'DRAFT' ? T.yellow : T.muted);
     charts.mode = new Chart($('#chart-mode'), {
       type: 'doughnut', data: { labels: modeLabels, datasets: [{ data: Object.values(data.modeMix), backgroundColor: modeColors }] },
-      options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { labels: { color: '#94a3b8' } } } }
+      options: { responsive: true, maintainAspectRatio: false, cutout: '72%', plugins: { legend: { position: 'right' } } }
     });
 
     // Task chart
     if (charts.tasks) charts.tasks.destroy();
     charts.tasks = new Chart($('#chart-tasks'), {
-      type: 'doughnut', data: { labels: ['Done', 'Pending'], datasets: [{ data: [data.taskCompletion.done, data.taskCompletion.pending], backgroundColor: ['#22c55e', '#eab308'] }] },
-      options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { labels: { color: '#94a3b8' } } } }
+      type: 'doughnut', data: { labels: ['Done', 'Pending'], datasets: [{ data: [data.taskCompletion.done, data.taskCompletion.pending], backgroundColor: [T.text, T.border] }] },
+      options: { responsive: true, maintainAspectRatio: false, cutout: '72%', plugins: { legend: { position: 'right' } } }
     });
 
     // Evaluations table
@@ -290,7 +323,7 @@
               <button class="btn btn-sm mode-btn" data-mode="AUTO">AUTO</button>
               <button class="btn btn-sm mode-btn" data-mode="DRAFT">DRAFT</button>
               <button class="btn btn-sm mode-btn" data-mode="OFF">OFF</button>
-              <button class="btn btn-sm" id="drop-btn" style="background:var(--red);color:#fff;border:none;cursor:pointer;margin-left:6px">Drop</button>
+              <button class="btn btn-sm btn-red" id="drop-btn" style="margin-left:6px">Drop</button>
             </div>
           </div>
           <div class="chat-messages" id="chat-messages">
@@ -585,19 +618,10 @@
       </div>
       <div class="section-title">Configuration</div>
       <div class="card">
-        <div class="setting-row"><span class="setting-key">OLLAMA_URL</span><span class="setting-val" id="cfg-ollama">Loading...</span></div>
-        <div class="setting-row"><span class="setting-key">MODEL_NAME</span><span class="setting-val" id="cfg-model">Loading...</span></div>
+        <div class="setting-row"><span class="setting-key">AI</span><span class="setting-val" id="cfg-ai">Loading...</span></div>
+        <div class="setting-row"><span class="setting-key">GEMINI_MODEL</span><span class="setting-val" id="cfg-model">Loading...</span></div>
         <div class="setting-row"><span class="setting-key">AXIOS_TIMEOUT_MS</span><span class="setting-val" id="cfg-timeout">Loading...</span></div>
         <div class="setting-row"><span class="setting-key">RATE_LIMIT_COOLDOWN_MS</span><span class="setting-val" id="cfg-ratelimit">Loading...</span></div>
-      </div>
-      <div class="section-title">API Key</div>
-      <div class="card">
-        <p style="color:var(--muted);margin:0 0 10px;font-size:13px">This dashboard is protected by an API key (set <code>API_KEY</code> in <code>.env</code>). Enter it here so the dashboard can talk to the server.</p>
-        <div style="display:flex;gap:8px;align-items:center">
-          <input id="api-key-input" type="password" placeholder="Enter API key..." style="flex:1;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:8px 12px;font-size:13px" autocomplete="off">
-          <button id="api-key-save" class="btn" style="background:var(--accent);color:#fff;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-weight:600">Save</button>
-          <span id="api-key-status" style="font-size:12px;color:var(--muted)"></span>
-        </div>
       </div>
       <div class="section-title">Pending Registrations</div>
       <div class="card">
@@ -607,17 +631,17 @@
       <div class="section-title">Import Contacts</div>
       <div class="card">
         <div style="display:flex;gap:12px;margin-bottom:12px">
-          <label class="btn" style="background:var(--accent);color:#fff;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-weight:600;display:inline-flex;align-items:center;gap:6px">
+          <label class="btn btn-primary" style="cursor:pointer">
             <input type="file" id="import-file" accept=".vcf,.csv,.txt" style="display:none">
             Upload .vcf / .csv
           </label>
           <span id="import-filename" style="font-size:13px;color:var(--muted);line-height:36px"></span>
         </div>
         <p style="color:var(--muted);margin:0 0 12px;font-size:13px">Or paste below — one contact per line: <code>number,name</code> or just <code>number</code>. vCard content also works.</p>
-        <textarea id="import-text" rows="8" placeholder="254712345678,John Doe&#10;254798765432&#10;--- or paste vCard (BEGIN:VCARD...) ---" style="width:100%;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:10px;font-family:monospace;font-size:13px;resize:vertical"></textarea>
+        <textarea id="import-text" rows="8" placeholder="254712345678,John Doe&#10;254798765432&#10;--- or paste vCard (BEGIN:VCARD...) ---" class="input"></textarea>
         <div style="display:flex;gap:8px;margin-top:10px;align-items:center">
-          <button id="import-btn" class="btn" style="background:var(--accent);color:#fff;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-weight:600">Import</button>
-          <button id="sync-btn" class="btn" style="background:var(--green);color:#fff;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-weight:600">Sync WhatsApp</button>
+          <button id="import-btn" class="btn btn-primary">Import</button>
+          <button id="sync-btn" class="btn">Sync WhatsApp</button>
           <span id="import-result" style="font-size:13px;color:var(--muted)"></span>
         </div>
       </div>
@@ -625,31 +649,11 @@
     // Fetch config
     try {
       const cfg = await api('/api/config');
-      $('#cfg-ollama').textContent = cfg.ollamaUrl || 'http://localhost:11434';
-      $('#cfg-model').textContent = cfg.modelName || 'kamila';
+      $('#cfg-ai').textContent = 'Gemini';
+      $('#cfg-model').textContent = cfg.modelName || '';
       $('#cfg-timeout').textContent = cfg.timeout || '30000';
       $('#cfg-ratelimit').textContent = cfg.rateLimit || '2000';
     } catch {}
-
-    // API key: prefill from localStorage, save on click
-    const apiKeyInput = $('#api-key-input');
-    const apiKeySave = $('#api-key-save');
-    const apiKeyStatus = $('#api-key-status');
-    if (apiKeyInput) apiKeyInput.value = localStorage.getItem('kamila_api_key') || '';
-    if (apiKeySave) apiKeySave.onclick = async () => {
-      const key = (apiKeyInput.value || '').trim();
-      if (!key) { apiKeyStatus.textContent = 'Key cleared'; apiKeyStatus.style.color = 'var(--muted)'; }
-      else { apiKeyStatus.textContent = 'Saving...'; apiKeyStatus.style.color = 'var(--muted)'; }
-      localStorage.setItem('kamila_api_key', key);
-      // Test the key
-      try {
-        const r = await fetch('/api/stats', { headers: { 'x-api-key': key } });
-        if (r.ok) { apiKeyStatus.textContent = key ? 'Saved & working ✓' : 'No key — running open'; apiKeyStatus.style.color = 'var(--green)'; }
-        else { apiKeyStatus.textContent = 'Saved (test failed: uses ?key or header)'; apiKeyStatus.style.color = 'var(--yellow)'; }
-      } catch {
-        apiKeyStatus.textContent = 'Saved (server unreachable)'; apiKeyStatus.style.color = 'var(--yellow)';
-      }
-    };
 
     // Pending registrations: load list + wire approve/reject
     const regList = $('#reg-list');
@@ -664,8 +668,8 @@
               <div style="font-weight:600">${esc(r.wa_name || r.submitted_name || 'Unknown')}</div>
               <div style="color:var(--muted);font-size:12px">${esc(r.phone)}</div>
             </div>
-            <button class="btn btn-sm" style="background:var(--green);color:#fff;border:none;cursor:pointer" onclick="window._regApprove('${esc(r.chat_id)}')">Approve</button>
-            <button class="btn btn-sm" style="background:var(--red);color:#fff;border:none;cursor:pointer" onclick="window._regReject('${esc(r.chat_id)}')">Reject</button>
+            <button class="btn btn-sm btn-primary" onclick="window._regApprove('${esc(r.chat_id)}')">Approve</button>
+            <button class="btn btn-sm btn-red" onclick="window._regReject('${esc(r.chat_id)}')">Reject</button>
           </div>`).join('');
       } catch (e) {
         regList.innerHTML = '<div style="color:var(--red)">Failed to load registrations.</div>';
@@ -739,157 +743,10 @@
     };
   }
 
-  // ══════════════════════════════════
-  // VIEW: Broadcast
-  // ══════════════════════════════════
-
-  async function renderBroadcast() {
-    const mount = $('#view-mount');
-    mount.innerHTML = `
-      <div class="section-title">Broadcast Message</div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
-        <div>
-          <div class="card" style="margin-bottom:12px">
-            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
-              <strong>Select Contacts</strong>
-              <div style="display:flex;gap:6px">
-                <button id="bc-select-all" class="btn-sm" style="background:var(--border);color:var(--text);border:none;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:12px">All</button>
-                <button id="bc-select-none" class="btn-sm" style="background:var(--border);color:var(--text);border:none;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:12px">None</button>
-                <span id="bc-selected-count" style="font-size:12px;color:var(--muted);line-height:24px">0 selected</span>
-              </div>
-            </div>
-            <input id="bc-search" type="text" placeholder="Search contacts..." style="width:100%;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:8px 10px;font-size:13px;margin-bottom:8px">
-            <div id="bc-contact-list" style="max-height:400px;overflow-y:auto;font-size:13px"></div>
-          </div>
-        </div>
-        <div>
-          <div class="card" style="margin-bottom:12px">
-            <strong>Message</strong>
-            <textarea id="bc-message" rows="6" placeholder="Write your broadcast message here..." style="width:100%;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:10px;font-size:13px;margin-top:8px;resize:vertical"></textarea>
-            <div style="display:flex;gap:8px;margin-top:10px;align-items:center;flex-wrap:wrap">
-              <select id="bc-enhance-mode" style="background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:13px">
-                <option value="professional">Professional</option>
-                <option value="casual">Casual</option>
-                <option value="friendly">Friendly</option>
-                <option value="formal">Formal</option>
-                <option value="polish">Polish</option>
-              </select>
-              <button id="bc-enhance-btn" style="background:var(--accent);color:#fff;border:none;padding:6px 14px;border-radius:6px;cursor:pointer;font-size:13px;font-weight:600">AI Enhance</button>
-              <span id="bc-enhance-status" style="font-size:12px;color:var(--muted)"></span>
-            </div>
-          </div>
-          <div class="card">
-            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
-              <strong>Send Settings</strong>
-            </div>
-            <div style="display:flex;gap:12px;align-items:center;margin-bottom:12px">
-              <label style="font-size:13px;color:var(--muted)">Delay between messages:</label>
-              <select id="bc-delay" style="background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px;font-size:13px">
-                <option value="1000">1 second</option>
-                <option value="2000" selected>2 seconds</option>
-                <option value="5000">5 seconds</option>
-                <option value="10000">10 seconds</option>
-              </select>
-            </div>
-            <button id="bc-send-btn" style="width:100%;background:var(--green);color:#fff;border:none;padding:12px;border-radius:6px;cursor:pointer;font-size:15px;font-weight:700">Send Broadcast</button>
-            <div id="bc-result" style="margin-top:10px;font-size:13px;color:var(--muted)"></div>
-          </div>
-        </div>
-      </div>
-    `;
-
-    // Load contacts
-    let contacts;
-    try { contacts = await api('/api/contacts'); } catch {}
-    if (!Array.isArray(contacts)) contacts = [];
-    const list = $('#bc-contact-list');
-    const selected = new Set(loadState('bc_selected', []));
-
-    function renderContacts(filter = '') {
-      const filtered = contacts.filter(c =>
-        (c.name || '').toLowerCase().includes(filter.toLowerCase()) ||
-        (c.phone_number || '').includes(filter)
-      );
-      list.innerHTML = filtered.map(c => `
-        <label style="display:flex;align-items:center;gap:8px;padding:4px 0;cursor:pointer;border-bottom:1px solid var(--border)">
-          <input type="checkbox" data-phone="${esc(c.phone_number)}" ${selected.has(c.phone_number) ? 'checked' : ''}>
-          <span style="flex:1">${esc(c.name || c.phone_number)}</span>
-          <span style="color:var(--muted);font-size:11px">${esc(c.phone_number)}</span>
-        </label>
-      `).join('');
-      list.querySelectorAll('input[type=checkbox]').forEach(cb => {
-        cb.onchange = () => {
-          if (cb.checked) selected.add(cb.dataset.phone); else selected.delete(cb.dataset.phone);
-          updateCount();
-          saveState('bc_selected', [...selected]);
-        };
-      });
-    }
-
-    function updateCount() {
-      $('#bc-selected-count').textContent = selected.size + ' selected';
-    }
-
-    renderContacts();
-    updateCount();
-    $('#bc-search').oninput = (e) => renderContacts(e.target.value);
-    $('#bc-select-all').onclick = () => { contacts.forEach(c => selected.add(c.phone_number)); renderContacts($('#bc-search').value); updateCount(); saveState('bc_selected', [...selected]); };
-    $('#bc-select-none').onclick = () => { selected.clear(); renderContacts($('#bc-search').value); updateCount(); saveState('bc_selected', [...selected]); };
-
-    // Restore saved message
-    const savedMsg = loadState('bc_message', '');
-    if (savedMsg) $('#bc-message').value = savedMsg;
-
-    // Save message on input
-    $('#bc-message').addEventListener('input', (e) => saveState('bc_message', e.target.value));
-
-    // AI Enhance
-    $('#bc-enhance-btn').onclick = async () => {
-      const text = $('#bc-message').value.trim();
-      const status = $('#bc-enhance-status');
-      if (!text) { status.textContent = 'Write a message first'; status.style.color = 'var(--red)'; return; }
-      status.textContent = 'Enhancing...';
-      status.style.color = 'var(--muted)';
-      try {
-        const mode = $('#bc-enhance-mode').value;
-        const res = await post('/api/enhance', { text, mode });
-        $('#bc-message').value = res.enhanced;
-        status.textContent = 'Enhanced!';
-        status.style.color = 'var(--green)';
-      } catch (err) {
-        status.textContent = 'Error: ' + err.message;
-        status.style.color = 'var(--red)';
-      }
-    };
-
-    // Send broadcast
-    $('#bc-send-btn').onclick = async () => {
-      const phones = [...selected];
-      const text = $('#bc-message').value.trim();
-      const result = $('#bc-result');
-      if (phones.length === 0) { result.textContent = 'Select at least one contact'; result.style.color = 'var(--red)'; return; }
-      if (!text) { result.textContent = 'Write a message'; result.style.color = 'var(--red)'; return; }
-      const delay = Number($('#bc-delay').value);
-      result.textContent = `Sending to ${phones.length} contacts...`;
-      result.style.color = 'var(--muted)';
-      $('#bc-send-btn').disabled = true;
-      try {
-        const res = await post('/api/broadcast', { contacts: phones, text, delayMs: delay });
-        result.innerHTML = `Sent: <strong>${res.sent}</strong> / Failed: <strong>${res.failed}</strong> / Total: ${res.total}`;
-        result.style.color = res.failed > 0 ? 'var(--yellow)' : 'var(--green)';
-      } catch (err) {
-        result.textContent = 'Error: ' + err.message;
-        result.style.color = 'var(--red)';
-      }
-      $('#bc-send-btn').disabled = false;
-    };
-  }
-
   // ── Routes ──
   route('#/overview', renderOverview);
   route('#/chats', renderChats);
   route('#/tasks', renderTasks);
-  route('#/broadcast', renderBroadcast);
   route('#/settings', renderSettings);
 
   // ── SSE wiring ──
@@ -901,17 +758,22 @@
   onSSE('status', (d) => {
     const el = $('#conn-status');
     el.className = 'conn-badge ' + (d.connected ? 'conn-on' : d.qr ? 'conn-qr' : 'conn-off');
-    $('.conn-text', el).textContent = d.connected ? 'Connected' : d.qr ? 'Scan QR' : 'Disconnected';
+    $('.conn-text', el).textContent = d.connected ? 'Online' : d.qr ? 'Scan QR' : 'Offline';
   });
 
-  // ── Init ──
-  refreshStatus();
-  refreshTaskBadge();
-  setInterval(refreshStatus, 15000);
-  setInterval(refreshTaskBadge, 30000);
-  connectSSE();
-  navigate();
+  // ── Init ── (called by auth-boot.js once gateway.js has registered its routes)
+  function start() {
+    if (Auth.isOwner) {
+      refreshStatus();
+      refreshTaskBadge();
+      setInterval(refreshStatus, 15000);
+      setInterval(refreshTaskBadge, 30000);
+    }
+    connectSSE();
+    navigate();
+  }
 
-  // Cleanup on view change
-  const origRender = { overview: renderOverview, chats: renderChats, tasks: renderTasks, settings: renderSettings };
+  // Small API so add-on pages (gateway.js) can register views.
+  window.KamilaDash = { $, $$, esc, toast, timeAgo, route, onSSE, navigate, authedFetch, start, onLeave: null };
+
 })();

@@ -1,0 +1,17 @@
+services:
+  kamila:
+    build: .
+    image: kamila:latest
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      NODE_ENV: production
+      TRUST_PROXY: "1"          # behind the reverse proxy below or your own
+    ports:
+      - "127.0.0.1:3000:3000"   # expose through a reverse proxy with HTTPS
+    volumes:
+      - kamila-data:/data       # SQLite + WhatsApp logins (don't lose this)
+    shm_size: "1gb"             # Chromium needs shared memory
+
+volumes:
+  kamila-data:

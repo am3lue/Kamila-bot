@@ -47,27 +47,3 @@ export function enforceWordCap(text, n = 10) {
   if (cutMidWord) out += '…';
   return out;
 }
-
-/**
- * Convert WhatsApp/markdown text to safe HTML for the dashboard.
- * Handles: *bold*, _italic_, ~strikethrough~, `code`, ```code blocks```
- */
-export function renderForDashboard(text) {
-  if (!text || typeof text !== 'string') return '';
-  let out = text;
-  // Escape HTML first
-  out = out.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  // Code blocks ```...```
-  out = out.replace(/```([\s\S]*?)```/g, '<pre class="md-code-block"><code>$1</code></pre>');
-  // Inline code `...`
-  out = out.replace(/`([^`]+)`/g, '<code class="md-inline-code">$1</code>');
-  // Bold *text*
-  out = out.replace(/\*([^*]+)\*/g, '<strong>$1</strong>');
-  // Italic _text_
-  out = out.replace(/_([^_]+)_/g, '<em>$1</em>');
-  // Strikethrough ~text~
-  out = out.replace(/~([^~]+)~/g, '<del>$1</del>');
-  // Newlines to <br>
-  out = out.replace(/\n/g, '<br>');
-  return out;
-}

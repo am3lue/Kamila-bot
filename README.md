@@ -1,175 +1,149 @@
-# Kamila WhatsApp Bot
+# Kamila
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Node.js](https://img.shields.io/badge/Node.js-%3E%3D18-brightgreen.svg)](https://nodejs.org/)
-[![WhatsApp Web.js](https://img.shields.io/badge/WhatsApp%20Web.js-1.34.7-blue.svg)](https://github.com/pedroslopez/whatsapp-web.js)
-[![Ollama](https://img.shields.io/badge/Ollama-supported-orange.svg)](https://ollama.ai/)
+[![Node.js](https://img.shields.io/badge/Node.js-%3E%3D20-brightgreen.svg)](https://nodejs.org/)
 
-WhatsApp bot powered by Ollama AI with a web dashboard, broadcast messaging, and contact management.
+Turn WhatsApp numbers into an API. Every **project** is one linked WhatsApp number that can **send messages** to anyone through the API, and also either:
 
-> Self-hosted. No cloud services. Your data stays on your machine.
+- **sends OTP codes** for your app (send + verify API), or
+- runs an **AI chatbot** (Gemini) that answers from your knowledge base, optionally asking your own API first. It answers on WhatsApp, on your website through a drop-in widget, and through a Chat API.
 
-![Dashboard](https://via.placeholder.com/800x400?text=Dashboard+Screenshot)
+It also includes **Kamila**, a personal AI assistant on the owner's own number, with chats, tasks and drafts.
+
+Sign-in is handled by [Tausi Auth](https://auth.tausi.app). Gateway data lives in [Supabase](https://supabase.com); the Kamila bot's data is a local SQLite file.
+
+> Kamila drives WhatsApp Web (via [whatsapp-web.js](https://github.com/pedroslopez/whatsapp-web.js)). This is unofficial, and WhatsApp can ban numbers that send spam or bulk messages. For high-volume OTP, the official WhatsApp Business Platform is the supported route.
 
 ## Features
 
-- **AI Auto-Reply** — Responds to WhatsApp messages using any Ollama model
-- **Three Modes** — `AUTO` (AI replies), `DRAFT` (AI drafts for your review), `OFF` (silent)
-- **Web Dashboard** — Stats, chat viewer, task tracker, broadcast sender, settings
-- **Broadcast Messaging** — Send to multiple contacts with configurable delay
-- **AI Message Enhancement** — Professional, casual, friendly, formal, polish modes
-- **Contact Import** — vCard (.vcf), CSV, or plain text with deduplication
-- **WhatsApp Sync** — Verify which imported contacts are on WhatsApp
-- **Group Read-Only** — Logs group messages for context without replying
-- **Auto-Reconnect** — Recovers from disconnections automatically
-- **Human Typing** — Response delay scales with message length
-- **Real-time Dashboard** — SSE updates with polling fallback
+| | |
+|---|---|
+| **Projects** | Many WhatsApp numbers per server, each owned by one user. QR linking in the dashboard, automatic reconnect |
+| **Send messages** | `POST /v1/messages` sends any text from any project (notifications, order updates). On a chatbot project, the AI continues the conversation when the person replies |
+| **Sender branding** | Set the number's WhatsApp name and logo from the dashboard so codes and messages show your business, not a bare number |
+| **OTP** | Hashed single-use codes, expiry, attempt lockout, resend cooldown, per-number hourly cap, editable message template, delivery status (sent → delivered → read → verified) |
+| **AI chatbot** | Gemini with instructions + knowledge base (file import), optional "answer URL" for live data, playground, conversation log, per-project model and API key |
+| **Integrations** | Secret keys for servers, publishable keys + allowed origins for the website widget, signed webhooks with retries and delivery logs |
+| **Dashboard** | Projects grid with activity sparklines, per-project overview (stats + 14/30-day chart), API keys, webhooks, settings, docs with code samples |
+| **Kamila bot** (owners) | Personal assistant on the owner's number: AUTO / DRAFT / OFF per contact, memory, task extraction, human hand-off, contact import |
 
-## Quick Start
+## Quick start
 
-### Prerequisites
-
-- **Node.js** >= 18
-- **Chromium** — Required by whatsapp-web.js for WhatsApp Web
-- **Ollama** — Running locally with at least one model pulled
-
-### Install
+Requirements: **Node.js 20+**, **Chromium or Chrome**, a **Supabase** project, a **Tausi Auth** project, and a **Gemini API key**.
 
 ```bash
-# Clone the repo
-git clone https://github.com/your-username/Kamila-Tsaap-Bot.git
-cd Kamila-Tsaap-Bot
-
-# Install dependencies
 npm install
-
-# Copy config
-cp .env.example .env
+cp .env.example .env     # fill in the REQUIRED values
+npm start                # http://localhost:3000
 ```
 
-### Run
+1. **Supabase:** run every file in `supabase/migrations/` in order (`supabase db push`, or paste them into the SQL editor). Put the project URL and **service-role** key in `.env`.
+2. **Tausi:** create a project at [auth.tausi.app](https://auth.tausi.app). Add your origin (e.g. `http://localhost:3000`) under **Allowed origins** and `<origin>/login.html` under **Redirect URLs**. Put the `pk_…` and `sk_…` keys in `.env`.
+3. **Owners:** set `OWNER_EMAILS` or `OWNER_PHONES` to your verified Tausi email/phone (or give your Tausi user the `admin` role).
+4. **Gemini:** set `GEMINI_API_KEY`.
+5. Open the dashboard, sign in, **Add new…** a project and scan its QR code (WhatsApp → Settings → Linked devices).
+
+## API
+
+Every project has keys on its **API keys** tab. The dashboard's **Docs** page has full examples in cURL, Node.js, Python and PHP.
+
+| Key | Where | Used for |
+|---|---|---|
+| `wsk_…` secret | Your server only | Messages API, OTP API, Chat API |
+| `wpk_…` publishable | Your website | Chat widget, only on allowed origins |
 
 ```bash
-# Terminal 1: Start Ollama
-ollama serve
-ollama pull qwen2.5-coder:0.5b   # or any model you prefer
+# Any project: send a WhatsApp message
+curl -X POST https://YOUR-HOST/v1/messages -H "Authorization: Bearer $KAMILA_SECRET_KEY" -H "Content-Type: application/json" -d '{"phone":"255712345678","text":"Your order has shipped"}'
 
-# Terminal 2: Start the bot
-npm start
+# OTP project
+curl -X POST https://YOUR-HOST/v1/otp/send   -H "Authorization: Bearer $KAMILA_SECRET_KEY" -H "Content-Type: application/json" -d '{"phone":"255712345678"}'
+curl -X POST https://YOUR-HOST/v1/otp/verify -H "Authorization: Bearer $KAMILA_SECRET_KEY" -H "Content-Type: application/json" -d '{"id":"otp_…","code":"482913"}'
+
+# Chatbot project ("user" keeps a separate conversation per end user)
+curl -X POST https://YOUR-HOST/v1/chat -H "Authorization: Bearer $KAMILA_SECRET_KEY" -H "Content-Type: application/json" -d '{"message":"Are you open on Sunday?","user":"customer-42"}'
 ```
 
-Open `http://localhost:3000` and scan the QR code with WhatsApp (Settings > Linked Devices > Link a Device).
+```html
+<!-- Chat widget for your website (chatbot project) -->
+<script src="https://YOUR-HOST/widget.js" data-key="wpk_…" defer></script>
+```
+
+| Endpoint | Auth | Description |
+|---|---|---|
+| `POST /v1/messages` | secret | `{ phone, text }` → `{ id, phone, status }` (any project) |
+| `POST /v1/otp/send` | secret | `{ phone, length?, ttl_seconds?, code? }` |
+| `POST /v1/otp/verify` | secret | `{ id \| phone, code }` → `{ valid, reason? }` |
+| `GET /v1/otp/:id`, `GET /v1/otp` | secret | Code status / recent codes |
+| `POST /v1/chat` | secret | `{ message, user? }` → `{ reply, source }` |
+| `GET /v1/contacts/:phone/check` | secret | Is the number on WhatsApp? |
+| `GET /v1/me` | secret | The project the key belongs to |
+| `GET /v1/widget/config`, `POST /v1/widget/chat` | publishable | Used by `widget.js` |
+| `/v1/sessions/…`, `/v1/account`, `/v1/stats/…` | dashboard sign-in | Project management (used by the dashboard) |
+
+**Chatbot answers:** each incoming message (WhatsApp, widget or Chat API) is first POSTed to the project's **answer URL**, if set. A `{"reply": "…"}` response is sent as-is. `{"reply": null}`, or no answer URL, lets Gemini answer from the instructions and knowledge base. If the AI fails, the customer gets nothing and the error shows in the dashboard.
+
+**Webhooks:** `otp.sent`, `otp.status`, `otp.verified`, `message.received`, `message.replied`, `message.sent`, `session.status`. Each is signed: `X-Webhook-Signature: sha256=HMAC(secret, "<X-Webhook-Timestamp>.<body>")`. Failed deliveries are retried after 5 s and 30 s.
+
+## Deploy
+
+Kamila is a long-running Node process with headless Chromium (one per WhatsApp number, ~200 MB RAM each). It needs a **persistent disk** for the WhatsApp logins (`WHATSAPP_AUTH_DIR`) and the Kamila bot's SQLite file (`DB_PATH`). Serverless platforms won't work; a VPS or container host will.
+
+```bash
+cp .env.example .env    # fill it in
+docker compose up -d --build
+docker compose logs -f
+```
+
+The compose file publishes the app on `127.0.0.1:3000` and keeps `/data` in a volume. Put it behind a reverse proxy with HTTPS (Caddy, nginx, Cloudflare Tunnel) and set `TRUST_PROXY=1`. Example Caddyfile:
+
+```
+kamila.example.com {
+  reverse_proxy 127.0.0.1:3000
+}
+```
+
+Then add `https://kamila.example.com` and `https://kamila.example.com/login.html` to your Tausi project.
+
+- **Health check:** `GET /healthz` returns `{ status, version, uptime }`.
+- **Logs:** go to stdout (`LOG_LEVEL`, optional `LOG_FILE`).
+- **Shutdown:** `SIGTERM` closes connections and the WhatsApp browsers cleanly.
+- **Scaling:** run a **single instance**. Each WhatsApp number is held by one process, and rate limits are kept in memory.
+
+Without Docker: install Chromium, set `CHROMIUM_PATH`, and run `npm ci --omit=dev && NODE_ENV=production node server.js` under systemd or pm2.
 
 ## Configuration
 
-All config is in `.env`. Copy from `.env.example` and edit:
+All settings are documented in [`.env.example`](.env.example). Required: `TAUSI_PUBLISHABLE_KEY`, `TAUSI_SECRET_KEY`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`. Strongly recommended: `GEMINI_API_KEY`, `OWNER_EMAILS`/`OWNER_PHONES`, `ENCRYPTION_KEY`, `OTP_PEPPER`.
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PORT` | `3000` | Dashboard server port |
-| `API_KEY` | *(empty)* | API key for external API consumers (kept in `.env`, never sent to the browser) |
-| `REQUIRE_AUTH` | *(empty)* | Set `1` to require the `x-api-key` header on `/api` routes. Leave empty for an open dashboard |
-| `OLLAMA_URL` | `http://localhost:11434/api/chat` | Ollama API endpoint |
-| `MODEL_NAME` | `kamila` | Ollama model to use |
-| `AXIOS_TIMEOUT_MS` | `30000` | Ollama request timeout (ms) |
-| `RATE_LIMIT_COOLDOWN_MS` | `2000` | Min delay between replies per user (ms) |
-| `PUPPETEER_HEADLESS` | `true` | Run Chromium headless (`false` for debugging) |
-| `PUPPETEER_ARGS` | `--no-sandbox,--disable-setuid-sandbox` | Chromium flags |
-| `CHROMIUM_PATH` | `/usr/bin/chromium` | Path to Chromium binary |
-| `DB_PATH` | `./kamila.db` | SQLite database file path |
-| `WHITELIST` | *(empty)* | Comma-separated boot numbers for the allowlist |
-| `BLACKLIST` | *(empty)* | Comma-separated boot numbers for the blocklist |
-
-## Access Control
-
-Restrict who the bot interacts with using a **whitelist** (allowlist) and **blacklist**:
-
-- **Blacklist always wins** — a blacklisted number is never replied to and never receives broadcasts, even if it is also whitelisted.
-- When the **whitelist is non-empty**, only whitelisted numbers may chat (allowlist mode).
-- When the whitelist is **empty**, everyone except blacklisted numbers is allowed.
-- Applies to **inbound** auto-replies, **outbound broadcasts**, **manual sends** (`/api/send`), and **draft sends** (`/api/send-draft`).
-- Phone numbers are matched in a canonical digits-only form, so inbound IDs like `12345@c.us`, `12345@lid`, or `12345@s.whatsapp.net` are handled the same.
-- Blocked numbers are silently ignored (their messages are still logged, but Kamila never responds).
-
-Manage the lists from **Dashboard → Settings → Access Control**, or seed initial values via the `WHITELIST` / `BLACKLIST` env vars (used only once at startup).
-
-## Dashboard
-
-| View | Description |
-|------|-------------|
-| **Overview** | Stats, volume chart, sentiment analysis, task completion |
-| **Chats** | View conversations, switch modes, send messages, save drafts |
-| **Tasks** | AI-extracted action items from conversations |
-| **Broadcast** | Send messages to multiple contacts with AI enhancement |
-| **Settings** | Import contacts, sync with WhatsApp |
-
-## API Reference
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `GET` | `/api/status` | Bot connection status |
-| `GET` | `/api/stats` | Dashboard statistics |
-| `GET` | `/api/contacts` | List all contacts |
-| `GET` | `/api/contacts/:id/messages` | Messages for a contact |
-| `GET` | `/api/messages` | All messages |
-| `GET` | `/api/tasks` | All tasks |
-| `GET` | `/api/events` | SSE stream for real-time updates |
-| `POST` | `/api/send` | Send message `{chatId, text}` |
-| `POST` | `/api/send-draft` | Send a saved draft |
-| `POST` | `/api/discard-draft` | Delete a draft |
-| `POST` | `/api/contacts/import` | Import contacts `{vcard}` or `{contacts}` |
-| `POST` | `/api/contacts/sync` | Check contacts against WhatsApp |
-| `POST` | `/api/broadcast` | Broadcast `{contacts, text, delayMs}` |
-| `POST` | `/api/enhance` | AI enhance text `{text, mode}` |
-| `POST` | `/api/tasks/:id/complete` | Mark task done |
-| `GET` | `/api/access` | Get whitelist & blacklist |
-| `POST` | `/api/access` | Add to access list `{phone, list_type}` |
-| `POST` | `/api/access/remove` | Remove from any list `{phone}` |
-| `POST` | `/api/access/clear` | Clear a list `{list_type}` |
-| `GET` | `/api/access/status/:phone` | Check if a number is allowed |
-
-## Project Structure
+## Project structure
 
 ```
-├── server.js              # Main server — bot logic, API, SSE, SQLite
-├── public/
-│   ├── dashboard.html     # SPA shell
-│   ├── dashboard.js       # Router, views, SSE client
-│   ├── dashboard.css      # Dark theme styles
-│   └── favicon.svg        # Bot icon
-├── .env.example           # Config template
-├── package.json
-└── kamila.db              # SQLite database (auto-created, gitignored)
+server.js              Config, wiring, HTTP server, auth proxy, live updates
+gateway/               WhatsApp projects (Supabase)
+  routes.js            /v1 API: projects, OTP, chat, widget, stats
+  sessions.js          One whatsapp-web.js client per project
+  chatbot.js           Answer URL → Gemini + knowledge base
+  gemini.js            Gemini REST client
+  webhooks.js          Signed webhooks + SSRF guard
+  auth.js              Tausi session checks, owners, SSE tickets
+  db.js, secrets.js, util.js
+bot/                   The owner's Kamila bot (SQLite)
+  kamila.js            Replies, memory, tasks, hand-off
+  routes.js            /api for the Kamila pages of the dashboard
+  store.js, memory.js, format.js, vcard.js
+prompts/kamila.md      Kamila's persona (Gemini system prompt)
+public/                Dashboard, sign-in page, widget.js
+supabase/migrations/   Database schema
 ```
 
 ## Troubleshooting
 
-**Bot won't connect / QR code not showing**
-- Ensure Chromium is installed: `which chromium`
-- Check `CHROMIUM_PATH` in `.env`
-- Try `PUPPETEER_HEADLESS=false` to debug
-
-**Ollama errors**
-- Ensure Ollama is running: `ollama serve`
-- Check model exists: `ollama list`
-- Increase timeout: `AXIOS_TIMEOUT_MS=60000`
-
-**Dashboard blank**
-- Check console for errors (F12)
-- Ensure port 3000 is free
-
-**Contact import not working**
-- vCard files must start with `BEGIN:VCARD`
-- Phone numbers need 7+ digits
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
-
-## Security
-
-Report vulnerabilities via [SECURITY.md](SECURITY.md). Do not open public issues for security bugs.
+- **No QR code:** check `CHROMIUM_PATH` and the logs. On a headless server use `PUPPETEER_HEADLESS=true` and make sure Chromium's dependencies are installed (the Docker image has them).
+- **Sign-in fails:** your origin and `<origin>/login.html` must be in the Tausi project, and `TRUST_PROXY=1` must be set behind a proxy.
+- **Bot doesn't reply:** open the project → **Playground**; the error is shown there (missing or bad Gemini key, unknown model, quota). The project must be in AI chatbot mode with instructions, a knowledge base or an answer URL.
+- **"Database schema is out of date" on start:** run the newest files in `supabase/migrations/`.
 
 ## License
 
-[MIT](LICENSE)
+MIT, see [LICENSE](LICENSE).

@@ -1,0 +1,13 @@
+node_modules
+.git
+.env
+.env.*
+!.env.example
+*.db
+*.db-shm
+*.db-wal
+.wwebjs_auth
+.wwebjs_cache
+logs
+*.log
+*.vcf
